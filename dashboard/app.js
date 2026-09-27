@@ -264,6 +264,9 @@ async function render(s) {
   // آخر التنبيهات — "إنصات" الداشبورد: نفس أحداث Telegram من البيانات
   renderAlerts(s.alert_log || []);
 
+  // سطر المزامنة: الـVM والتيليغرام والداشبورد على خط واحد
+  renderSync(s);
+
   // حالة مصادر البيانات — أي مصدر نشط الآن في كل سلسلة احتياطية
   renderSources(s.sources || {});
 
@@ -436,6 +439,26 @@ function renderResearch2(r2) {
     (r2.best_coin ? " • أفضل عملة: " + r2.best_coin : "");
 }
 
+// سطر المزامنة: إثبات مرئي أن الـVM والتيليغرام والداشبورد على خط واحد.
+// يقرأ s.sync الذي يكتبه الـVM بعد كل نشر متحقق من الـGist.
+function renderSync(s) {
+  const el = $("sync-line");
+  if (!el) return;
+  const sy = (s && s.sync) || {};
+  const dashOk = sy.gist_ok !== false;
+  const pend = sy.tg_pending || 0;
+  const tgOk = pend === 0;
+  let when = "—";
+  if (sy.gist_checked_at) {
+    const mins = Math.max(0, Math.round((Date.now() / 1000 - sy.gist_checked_at) / 60));
+    when = mins < 1 ? "قبل لحظات" : `قبل ${mins} د`;
+  }
+  const dot = ok => ok ? "✓" : "⚠";
+  const allOk = dashOk && tgOk && sy.gist_checked_at;
+  el.innerHTML = `🔗 المزامنة: السيرفر ${dot(true)} · الداشبورد ${dot(dashOk)} · تيليغرام ${dot(tgOk)}${pend ? ` (${pend} معلقة)` : ""} <span class="text-slate-600">— آخر تحقق ${when}</span>`;
+  el.style.color = allOk ? "" : "#fbbf24";
+  el.style.fontWeight = allOk ? "" : "bold";
+}
 function renderAlerts(log) {  const el = $("a-list");
   if (!log.length) {
     el.innerHTML = `<div class="glass p-6 text-center text-slate-500">لا تنبيهات بعد — ستظهر هنا نفس رسائل Telegram من أول Run</div>`;
