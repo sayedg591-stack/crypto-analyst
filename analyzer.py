@@ -6,6 +6,7 @@ from config import (
     MIN_LIQUIDITY_USD, MIN_VOLUME_24H_USD, MAX_PAIR_AGE_DAYS,
     WASH_RATIO_LIMIT, HOLDER_TOP10_REJECT, ZERO_WIDTH_CHARS, KNOWN_SYMBOLS,
     FDV_LIQ_RATIO_LIMIT, SECURITY_FAILSAFE_REJECT, INSTRUMENT_METRICS,
+    MAX_BUY_TAX_PCT, MAX_SELL_TAX_PCT,
 )
 
 
@@ -88,10 +89,12 @@ def signal_of(score):
 
 
 def analyze_pair(pair, security=None, boosted=False, holders=None,
-                 security_unknown=False):
+                 security_unknown=False, security_error=None):
     """تقييم عملة جديدة من بيانات Dexscreener + فحص العقد.
     boosted: هل الفريق يروّج لها بترويج مدفوع على Dexscreener؟
-    security_unknown: تعذّر فحص الأمان (API فشل) — الافتراض الآمن يرفضها فوراً."""
+    security_unknown: تعذّر فحص الأمان (API فشل) — الافتراض الآمن يرفضها فوراً.
+    security_error: سبب الفشل الحقيقي (من clients.LAST_SEC_ERROR) — يظهر في
+    السجل بدل "API لا يستجيب" الغامضة."""
     reasons, warnings = [], []
     score = 0
 
@@ -119,7 +122,8 @@ def analyze_pair(pair, security=None, boosted=False, holders=None,
     # 0ب) الافتراض الآمن (Fail-Safe): فشل فحص الأمان = عملة خطيرة ومرفوضة
     # (لا نتجاوز الفحص أبداً — الغياب التام للبيانات أخطر من البيانات السيئة)
     if security_unknown and SECURITY_FAILSAFE_REJECT:
-        warnings.append("⛔ تعذّر فحص أمان العقد (API لا يستجيب) — "
+        cause = f" ({security_error})" if security_error else " (API لا يستجيب)"
+        warnings.append("⛔ تعذّر فحص أمان العقد" + cause + " — "
                         "الافتراض الآمن: مرفوضة حتى يتوفر الفحص")
         return _result(3, pair, base, quote, price, liq, vol24, pc1h, pc24h,
                        buys, sells, age_h, reasons, warnings)
@@ -203,11 +207,18 @@ def analyze_pair(pair, security=None, boosted=False, holders=None,
         score += 12
         reasons.append("فحص العقد: البيع يعمل بشكل طبيعي")
         bt, stx = security.get("buy_tax", 0), security.get("sell_tax", 0)
-        if bt <= 10 and stx <= 10:
+        # v2 — بوابة الضرائب (بحث BSC/GMGN): ضريبة شراء أو بيع >10% = فخ
+        # ضريبي → رفض فوري (0% آمن، 1-5% تحذير، >10% رفض)
+        if bt > MAX_BUY_TAX_PCT or stx > MAX_SELL_TAX_PCT:
+            warnings.append(f"⛔ ضريبة فخ: شراء {bt:.0f}% / بيع {stx:.0f}% "
+                            f"(الحد {MAX_SELL_TAX_PCT:.0f}%) — رفض فوري")
+            return _result(5, pair, base, quote, price, liq, vol24, pc1h, pc24h,
+                           buys, sells, age_h, reasons, warnings)
+        if bt <= 5 and stx <= 5:
             score += 5
             reasons.append(f"ضرائب منخفضة (شراء {bt:.0f}% / بيع {stx:.0f}%)")
         else:
-            warnings.append(f"ضرائب مرتفعة (شراء {bt:.0f}% / بيع {stx:.0f}%) — تأكل الربح")
+            warnings.append(f"ضرائب متوسطة (شراء {bt:.0f}% / بيع {stx:.0f}%) — تأكل الربح")
         if (security.get("risk_level") or 0) >= 4:
             warnings.append(f"مستوى خطر مرتفع حسب الفحص ({security.get('risk')})")
         else:

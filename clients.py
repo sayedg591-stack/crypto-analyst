@@ -356,11 +356,15 @@ def _goplus_security(chain, address):
     مصدر احتياطي: يُستدعى فقط عند فشل المصدر الأساسي
     (honeypot.is / RugCheck) — فلسفة التدوير القاسي: الفشل الفوري
     ينتقل للبديل في نفس اللحظة بدل رفض العملة."""
+    global _GOPLUS_LAST_CODE
+    _GOPLUS_LAST_CODE = None
     gid = GOPLUS_CHAIN_IDS.get(chain)
     if not gid or not address:
         return None
     data = _get(f"{GOPLUS_API}/api/v1/token_security/{gid}",
                 params={"contract_addresses": address})
+    if data is not None:
+        _GOPLUS_LAST_CODE = data.get("code")
     if not data or str(data.get("code")) != "1":
         return None
     info = (data.get("result") or {}).get((address or "").lower()) or {}
@@ -383,12 +387,54 @@ def _goplus_security(chain, address):
     }
 
 
+def _http_desc():
+    """وصف مقروء لآخر فشل HTTP — للتشخيص في السجلات."""
+    s = _get.last_status
+    return "network/timeout" if s == 0 else f"HTTP {s}"
+
+
+def _goplus_desc():
+    """سبب فشل GoPlus بدقة: يميّز حمولة الخطأ (HTTP 200 + code≠1)
+    عن فشل الشبكة — لأن GoPlus يرد أحياناً 200 مع {"code":5000}."""
+    s = _get.last_status
+    c = _GOPLUS_LAST_CODE
+    if s == 200 and c is not None and str(c) != "1":
+        return f"HTTP 200 + error payload (code {c})"
+    return _http_desc()
+
+
+# آخر سبب لفشل فحص الأمان (سلسلة المصادر الفاشلة) — يقرأها المحلل
+# لعرض السبب الحقيقي في السجل بدل "API لا يستجيب" الغامضة.
+# تُصفَّر مع كل فحص جديد؛ الفشل لا يُخزَّن في الكاش (fail-closed محفوظ).
+LAST_SEC_ERROR = None
+# كود حمولة GoPlus الأخير (لتمييز "HTTP 200 بحمولة خطأ" عن فشل الشبكة)
+_GOPLUS_LAST_CODE = None
+# هل ردّ RugCheck بحمولة غير صالحة رغم HTTP 200؟
+_RUGCHECK_BAD_PAYLOAD = False
+
+
 def _token_security_live(chain, address):
     """يفحص: هل البيع مستحيل؟ ما الضرائب؟ ما مستوى الخطر؟
     EVM → honeypot.is ثم GoPlus | Solana → RugCheck ثم GoPlus.
-    الفشل المزدوج فقط = مجهول (fail-closed محفوظ: الرفض الآمن يبقى)."""
+    الفشل المزدوج فقط = مجهول (fail-closed محفوظ: الرفض الآمن يبقى).
+    عند الفشل: LAST_SEC_ERROR تحمل سبب كل مصدر — لا مزيد من التخمين."""
+    global LAST_SEC_ERROR
+    LAST_SEC_ERROR = None
+    errs = []
     if chain == "solana":
-        return _solana_security(address) or _goplus_security(chain, address)
+        r = _solana_security(address)
+        if r:
+            return r
+        if _get.last_status == 200 and _RUGCHECK_BAD_PAYLOAD:
+            errs.append("RugCheck: HTTP 200 + invalid payload")
+        else:
+            errs.append(f"RugCheck: {_http_desc()}")
+        g = _goplus_security(chain, address)
+        if g:
+            return g
+        errs.append(f"GoPlus: {_goplus_desc()}")
+        LAST_SEC_ERROR = " ← ".join(errs)
+        return None
     chain_id = HONEYPOT_CHAIN_IDS.get(chain)
     if chain_id:
         data = _get(f"{HONEYPOT_API}/IsHoneypot",
@@ -406,7 +452,16 @@ def _token_security_live(chain, address):
                 "holders": _num((data.get("token") or {}).get("totalHolders")),
                 "lp_locked": 0,
             }
-    return _goplus_security(chain, address)
+        if _get.last_status == 200 and data:
+            errs.append("honeypot.is: HTTP 200 + invalid payload")
+        else:
+            errs.append(f"honeypot.is: {_http_desc()}")
+    g = _goplus_security(chain, address)
+    if g:
+        return g
+    errs.append(f"GoPlus: {_goplus_desc()}")
+    LAST_SEC_ERROR = " ← ".join(errs) if errs else "unknown"
+    return None
 
 
 def token_security(chain, address):
@@ -423,8 +478,13 @@ def token_security(chain, address):
 
 
 def _solana_security(mint):
+    global _RUGCHECK_BAD_PAYLOAD
+    _RUGCHECK_BAD_PAYLOAD = False
     data = _get(f"{RUGCHECK_API}/v1/tokens/{mint}/report/summary")
-    if not data or "risks" not in data:
+    if not data:
+        return None
+    if "risks" not in data:
+        _RUGCHECK_BAD_PAYLOAD = True  # HTTP 200 لكن بلا حقل risks
         return None
     risks = data.get("risks") or []
     dangers = [r for r in risks if r.get("level") == "danger"]

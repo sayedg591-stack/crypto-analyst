@@ -20,6 +20,7 @@ from statelock import state_locked
 from config import (
     CHAINS, SCAN_LIMIT, MIN_LIQUIDITY_USD, MIN_VOLUME_24H_USD,
     MIN_TXNS_24H, MAX_PAIR_AGE_DAYS, WATCHLIST, TAKE_PROFITS, STOP_LOSS,
+    TRAIL_PCT, MOMENTUM_CUTOFF_H, MOMENTUM_MIN_GAIN,
     POSITION_MAX_AGE_H, DIGEST_HOURS_UTC, USE_COINGECKO, USE_NEWS,
     USE_FNG, NEW_ALERT_MAX_AGE_H, WAITLIST_MAX_AGE_H, WAITLIST_MAX_SIZE,
     WAITLIST_ADD_PER_RUN, POS_REEVAL_MIN_SCORE, POS_REEVAL_MIN_AGE_H,
@@ -514,11 +515,14 @@ def scan_new_coins(s, dry_run, ctx):
         sec = clients.token_security(chain, addr) if addr else None
         # الافتراض الآمن: فشل فحص الأمان لعملة بعنوان معروف = مرفوضة
         sec_failed = bool(addr) and sec is None
+        # سبب الفشل الحقيقي (إن وُجد) — يظهر في السجل بدل التخمين
+        sec_err = getattr(clients, "LAST_SEC_ERROR", None) if sec_failed else None
         # 🐋 فحص تركيز الحيتان (Solana فقط — مجاني بلا مفتاح عبر RugCheck)
         holders = (clients.solana_top10_pct(addr)
                    if (chain == "solana" and addr) else None)
         res = analyzer.analyze_pair(p, sec, boosted=boosted, holders=holders,
-                                    security_unknown=sec_failed)
+                                    security_unknown=sec_failed,
+                                    security_error=sec_err)
         res["id"] = f"dex:{chain}:{p.get('pairAddress')}"
         res["kind"] = "dex"
         res["chain"] = chain
@@ -604,10 +608,12 @@ def check_waitlist(s, dry_run, ctx):
             continue
         # الافتراض الآمن: فشل فحص الأمان = مرفوضة
         sec_failed = bool(addr) and sec is None
+        sec_err = getattr(clients, "LAST_SEC_ERROR", None) if sec_failed else None
         holders = (clients.solana_top10_pct(addr)
                    if (e["chain"] == "solana" and addr) else None)
         res = analyzer.analyze_pair(p, sec, holders=holders,
-                                    security_unknown=sec_failed)
+                                    security_unknown=sec_failed,
+                                    security_error=sec_err)
         res["id"] = wid
         res["kind"] = "dex"
         res["chain"] = e["chain"]
@@ -935,6 +941,8 @@ def _update_one_paper_position(s, p, pid, pos, closed, partials, dry_run):
     if market_store is not None:
         _snapshot_position(pos, price, _liq)
     entry = pos["entry"]
+    # v2: تتبع أعلى قمة — الوقف المتحرك لحقيبة القمر يتبعها
+    pos["peak"] = max(pos.get("peak") or entry, price)
     # ترحيل: صفقات قديمة قبل تبسيط الأهداف (3 → 1)
     th = pos.get("tp_hit") or []
     pos["tp_hit"] = (th + [False] * len(TAKE_PROFITS))[:len(TAKE_PROFITS)]
@@ -943,8 +951,25 @@ def _update_one_paper_position(s, p, pid, pos, closed, partials, dry_run):
     # سعر التنفيذ الواقعي عند البيع (أرخص بسبب الانزلاق) — التفعيل يبقى
     # على سعر السوق الخام، لكن التنفيذ الفعلي ينزلق
     eff_price = price * (1 - PAPER_SLIPPAGE)
-    # نظام الاستثمار: هدف1 +100% (بيع 50% + وقف التعادل للباقي)،
-    # هدف2 +300% (خروج كامل للباقي)
+    # ⏱️ فلتر الزخم (v2): بعد 48 ساعة بلا هدف وبلا زخم حقيقي (+30%) —
+    # الأطروحة ميتة: خروج مبكر بدل انتظار 7 أيام على عملة لا تتحرك
+    age_h = (time.time() - pos["entry_time"]) / 3600
+    if (age_h > MOMENTUM_CUTOFF_H and not (pos["tp_hit"] or [False])[0]
+            and price < entry * (1 + MOMENTUM_MIN_GAIN)):
+        pnl, _proceeds = _paper_close(p, pid, pos, eff_price, "TIME",
+                                      s, dry_run)
+        closed.append(pid)
+        print(f"  -> وهمي: ⏱️ زخم ميت {pos['name']} (${pnl:+.2f}) — "
+              f"{age_h:.0f}h بلا هدف")
+        alerts.send(alerts.paper_closed_msg(
+            pos["name"], pnl,
+            pnl / pos["invested"] * 100 if pos["invested"] else 0,
+            f"⏱️ زخم ميت: {age_h:.0f}h بلا هدف ولا +{MOMENTUM_MIN_GAIN * 100:.0f}%",
+            p["cash"]),
+            dry_run)
+        return
+    # نظام v2: 3 أهداف (+100%/+300%/+900% — بيع 25% عند كل هدف)
+    # والـ25% الأخيرة "حقيبة القمر" يتبعها وقف متحرك 30% تحت القمة
     for i, tp in enumerate(TAKE_PROFITS):
         if not pos["tp_hit"][i] and price >= entry * (1 + tp):
             pos["tp_hit"][i] = True
@@ -969,7 +994,7 @@ def _update_one_paper_position(s, p, pid, pos, closed, partials, dry_run):
             part_pnl = proceeds - sell_qty * entry
             pos["qty"] -= sell_qty
             pos["realized"] += part_pnl
-            pos["be"] = True  # 🛡️ النصف المتبقي أصبح خالي المخاطر
+            pos["be"] = True  # 🛡️ الباقي أصبح خالي المخاطر (وقف متحرك يتبع القمة)
             p["cash"] += proceeds
             print(f"  -> وهمي: جني جزئي {frac*100:.0f}% {pos['name']} "
                   f"(+${part_pnl:.2f} محقق) — وقف الخسارة → الدخول")
@@ -990,9 +1015,13 @@ def _update_one_paper_position(s, p, pid, pos, closed, partials, dry_run):
             break
     if pid in closed:
         return
-    # وقف الخسارة: بعد الجني ينتقل لسعر الدخول (تعادل) — قبل الجني -60%
+    # وقف الخسارة (v2): قبل أي جني -30%؛ بعد الجني الأول: max(الدخول،
+    # القمة × (1-30%)) — حقيبة القمر تؤمّن الربح تلقائياً بدل انتظار الانهيار.
     # (خسارة ≥70% فجأة → "انهيار" Rug Pull بدل وقف الخسارة العادي)
-    stop = entry if pos.get("be") else entry * (1 - STOP_LOSS)
+    if pos.get("be"):
+        stop = max(entry, (pos.get("peak") or entry) * (1 - TRAIL_PCT))
+    else:
+        stop = entry * (1 - STOP_LOSS)
     if price <= stop:
         loss = 1 - price / entry
         rug = loss >= RUG_ALERT_LOSS
@@ -1000,6 +1029,9 @@ def _update_one_paper_position(s, p, pid, pos, closed, partials, dry_run):
             blacklist_rug(s, pos, loss)
         if rug:
             reason, arch = "🚨 انهيار مفاجئ (Rug Pull)", "RUG"
+        elif pos.get("be") and stop > entry * 1.005:
+            reason = "📈 وقف متحرك: ربح مؤمّن لحقيبة القمر"
+            arch = "TRAIL"
         elif pos.get("be"):
             reason, arch = "⚖️ تعادل: خروج عند سعر الدخول", "BE"
         else:
@@ -1016,7 +1048,7 @@ def _update_one_paper_position(s, p, pid, pos, closed, partials, dry_run):
         return
     # 💀 إشارات موت العملة (صفقات DEX فقط — بيانات DexScreener مجانية):
     # إشارتان مؤكدتان معاً = خروج كامل فوري. المستثمر يقطع الميتة رخيصة
-    # بدل انتظار وقف -60% أو انتهاء 14 يوماً. إشارة واحدة = مراقبة فقط.
+    # بدل انتظار وقف -30% أو انتهاء 7 أيام. إشارة واحدة = مراقبة فقط.
     if pos.get("kind") == "dex":
         try:
             pair, _ds_src = clients.pair_chain(s, pos["chain"], pos["pair"])
@@ -1130,7 +1162,7 @@ def update_positions(s, dry_run):
             if not pos["tp_hit"][i] and price >= entry * (1 + tp):
                 pos["tp_hit"][i] = True
                 pos["best_hit"] = f"tp{i + 1}"
-                pos["be"] = True  # 🛡️ النصف المتبقي أصبح خالي المخاطر
+                pos["be"] = True  # 🛡️ الباقي أصبح خالي المخاطر (وقف متحرك يتبع القمة)
                 print(f"  -> تحقق الهدف: {pos['name']} — وقف الخسارة → الدخول")
                 alerts.send(alerts.tp_hit_msg(pos["name"], entry, price, i), dry_run)
                 break
@@ -1138,8 +1170,12 @@ def update_positions(s, dry_run):
             continue
         # وقف الخسارة — أو "انهيار مفاجئ" إن تجاوزت الخسارة 70% فجأة
         # (يُرجح سحب سيولة، فيُسجل كنوع مستقل "rug" بدل "sl")
-        # بعد الجني: الوقف عند سعر الدخول (تعادل) بدل -15%
-        stop = entry if pos.get("be") else entry * (1 - STOP_LOSS)
+        # v2: بعد الجني: max(الدخول، القمة×(1-30%)) — وقف متحرك بدل التعادل الثابت
+        pos["peak"] = max(pos.get("peak") or entry, price)
+        if pos.get("be"):
+            stop = max(entry, pos["peak"] * (1 - TRAIL_PCT))
+        else:
+            stop = entry * (1 - STOP_LOSS)
         if price <= stop:
             loss = 1 - price / entry
             if loss >= RUG_ALERT_LOSS:
@@ -1150,9 +1186,17 @@ def update_positions(s, dry_run):
                                                 blacklisted), dry_run)
                 st.record_outcome(s, pos, "rug")
             elif pos.get("be"):
-                print(f"  -> ⚖️ تعادل: {pos['name']} (خروج عند الدخول)")
-                alerts.send(alerts.be_stop_msg(pos["name"], entry), dry_run)
-                st.record_outcome(s, pos, "tp1")  # الهدف تحقق والباقي خرج متعادلاً
+                if stop > entry * 1.005:
+                    print(f"  -> 📈 وقف متحرك: {pos['name']} (ربح مؤمّن)")
+                    alerts.send(
+                        f"📈 <b>وقف متحرك</b>: {pos['name']} — حقيبة القمر "
+                        f"أمّنت ربحها عند {price:.6g} (الدخول {entry:.6g})",
+                        dry_run)
+                    st.record_outcome(s, pos, "trail")
+                else:
+                    print(f"  -> ⚖️ تعادل: {pos['name']} (خروج عند الدخول)")
+                    alerts.send(alerts.be_stop_msg(pos["name"], entry), dry_run)
+                    st.record_outcome(s, pos, "tp1")  # الهدف تحقق والباقي خرج متعادلاً
             else:
                 print(f"  -> وقف الخسارة: {pos['name']}")
                 alerts.send(alerts.stop_loss_msg(pos["name"], entry, price),
@@ -1432,9 +1476,9 @@ def _monitor(a):
 
     يستعمل نفس دوال المتابعة بالضبط المستعملة في الفحص الكامل
     (update_positions للصفقات المتابعة + update_paper للمحفظة الوهمية) —
-    نفس القواعد: هدف1 +100% (بيع 50%)، هدف2 +300% (خروج كامل)،
-    وقف الخسارة -60%، الانهيار، وانتهاء
-    المدة 14 يوماً — لكن بلا build_context الثقيل وبلا اكتشاف عملات جديدة
+    نفس القواعد (v2): 3 أهداف (+100%/+300%/+900% — بيع 25% لكل هدف)
+    + حقيبة قمر 25% بوقف متحرك 30%، وقف الخسارة -30%، فلتر الزخم 48h،
+    الانهيار، وانتهاء المدة 7 أيام — لكن بلا build_context الثقيل وبلا اكتشاف عملات جديدة
     وبلا شراء وبلا ملخصات. النتيجة: دقة الخروج ~دقيقة بدل ~دقيقتين،
     بتكلفة بضعة طلبات API فقط (سعر كل صفقة مفتوحة)."""
     s = st.load()
