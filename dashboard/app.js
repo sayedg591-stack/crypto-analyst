@@ -223,8 +223,10 @@ async function render(s) {
   const tr = p.trades || 0;
   $("s-win").textContent = tr ? Math.round(100 * (p.wins || 0) / tr) + "%" : "—";
   const hist = s.history || [];
-  const wins = hist.filter(h => ["tp1", "tp2", "tp3"].includes(h.outcome)).length;
-  $("s-hit").textContent = hist.length ? Math.round(100 * wins / hist.length) + "%" : "—";
+  // ذاكرة الخبير: نتائج نسخة الاستراتيجية الحالية فقط (الأرشيف القديم محفوظ لكن لا يُعلَّم عليه)
+  const hv = hist.filter(h => (h.strat || "v1") === (s.strat_version || "v1"));
+  const wins = hv.filter(h => ["tp1", "tp2", "tp3"].includes(h.outcome)).length;
+  $("s-hit").textContent = hv.length ? Math.round(100 * wins / hv.length) + "%" : "—";
   $("s-rug").textContent = hist.filter(h => h.outcome === "rug").length || "0";
   $("s-bl").textContent = Object.keys(s.rug_blacklist || {}).length || "0";
   $("s-sig").textContent = Object.keys(s.alerted || {}).length;
@@ -239,9 +241,9 @@ async function render(s) {
   $("fc-loss").textContent = currentCards.filter(c => c.pnl < 0).length || "";
   applyFilter(activeFilter);
 
-  // الرسم البياني: نجاح يومي
+  // الرسم البياني: نجاح يومي (نسخة الاستراتيجية الحالية فقط)
   const days = {};
-  for (const h of hist) {
+  for (const h of hv) {
     const d = new Date(h.time * 1000).toISOString().slice(0, 10);
     days[d] = days[d] || {w: 0, n: 0};
     days[d].n++;
