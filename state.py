@@ -231,7 +231,9 @@ def record_outcome(s, pos, outcome):
         "band": pos.get("band") or "؟",
         "score": pos.get("score"),
         "outcome": outcome,
-        "strat": STRATEGY_VERSION,  # تُحسب في ذاكرة هذه النسخة فقط
+        # تُحسب في ذاكرة نسخة الدخول — لا النسخة الحالية: صفقة دُخلت
+        # قبل v2 ثم أُغلقت بعدها يجب ألا تُعلِّم v2 (طلب صريح)
+        "strat": pos.get("strat") or "v1",  # تُحسب في ذاكرة هذه النسخة فقط
         "time": time.time(),
     })
     s["history"] = h[-200:]

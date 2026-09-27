@@ -85,14 +85,6 @@ def _flush_persisted(token, chat):
               f"(متبقٍ: {len(q)})")
 
 
-def pending_count():
-    """عدد الرسائل المعلقة (ذاكرة + دائم) — لحالة المزامنة في الداشبورد."""
-    n = len(_PENDING)
-    q = _persisted()
-    if q:
-        n += len(q)
-    return n
-
 
 # خطاف سجل التنبيهات: يضبطه main.py ليحفظ كل تنبيه في الحالة (state)
 # فيُعرض في الداشبورد — هكذا "ينصت" الداشبورد لكل ما يُرسل إلى Telegram
@@ -361,15 +353,6 @@ def be_stop_msg(name, entry, realized_note=""):
         f"السعر عاد لسعر الدخول ({fmt_price(entry)}) فأُغلق النصف المتبقي "
         f"<b>بدون أي خسارة</b>.{extra}\n"
         f"✅ الصفقة مؤمّنة: الربح المحقق من النصف الأول محفوظ."
-    )
-
-
-def all_tp_msg(name, entry, price):
-    gain = (price / entry - 1) * 100
-    return (
-        f"🏆 <b>اكتملت كل الأهداف — {html.escape(name)}</b> 🎉\n"
-        f"من {fmt_price(entry)} إلى {fmt_price(price)} (ربح: +{gain:.1f}%)\n"
-        f"أحسنت! توقفت عن متابعة هذه الصفقة."
     )
 
 

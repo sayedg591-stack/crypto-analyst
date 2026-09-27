@@ -32,7 +32,7 @@ from config import (
     DEATH_LIQ_USD, DEATH_VOL_M5_USD, DEATH_NOBUY_MIN_SELLS,
     DEATH_CONFIRM_MIN, DEATH_MIN_AGE_H,
     USE_XBRIDGE, XBRIDGE_MAX_AGE_H,
-    MIN_PROBABILITY, OPS_INBOX_ENABLED,
+    MIN_PROBABILITY, OPS_INBOX_ENABLED, STRATEGY_VERSION,
 )
 
 # عتبات الانهيار والقائمة السوداء
@@ -683,6 +683,9 @@ def open_position(s, res, verdict=None):
         "score": res.get("score"),
         "band": (verdict or {}).get("band") or expert.band_of(res.get("score")),
         "best_hit": None,
+        # نسخة الاستراتيجية عند الدخول — ذاكرة الخبير تُعلَّم كل نسخة
+        # على صفقاتها فقط (الطلب: v2 تُحاسَب على ماتشاتها هي)
+        "strat": STRATEGY_VERSION,
     }
     return True
 
@@ -1096,6 +1099,11 @@ def update_paper(s, dry_run):
             continue
     for pid in closed:
         p["positions"].pop(pid, None)
+        # خط واحد: إغلاق الورقية يُسقط توأم المتابعة معها — كانت التوأمة
+        # تُترك يتيمة فتستمر تنبيهاتها (وقف/هدف/انتهاء) لصفقة خرجت منها
+        # المحفظة فعلاً. بلا هذا السطر، كل وقف خسارة ورقي كان يخلق
+        # "صفقة شبح" تُنبّه بلا رصيد خلفها حتى انتهاء 7 أيام.
+        s["positions"].pop(pid, None)
     # حارس الأرشيف: كل إغلاق في هذا التشغيل يجب أن يقابله سجل —
     # أي فجوة تُعلن فوراً بدل أن تُكتشف بعد أسابيع
     arch_after = len(p.get("closed_trades", []))
