@@ -1334,6 +1334,9 @@ def maybe_digest(s, dry_run, movers, ctx):
         "fng": ctx.get("fng"),
         "news_stats": ctx.get("news_stats") or {},
         "paper": paper_summary(s) if PAPER_ENABLED else None,
+        # حالة المزامنة (من آخر نشر متحقق): سطر واحد في الملخص يثبت أن
+        # التيليغرام والداشبورد والـVM على خط واحد
+        "sync": s.get("sync") or {},
     }
     date_str = now.strftime("%Y-%m-%d")
     print("=== إرسال الملخص اليومي ===")
@@ -1393,6 +1396,37 @@ def _log_alert(s, kind, text):
     # حد أقصى: أحدث 40 تنبيهاً — لمنع تضخم الـGist
     if len(log) > 40:
         del log[:len(log) - 40]
+
+
+def _sync_publish(s, dry_run):
+    """نشر متزامن واحد: VM → الـGist (الداشبورد) مع تحقق فعلي من الوصول،
+    وتصريف طابور Telegram الدائم — الثلاثة على خط واحد دائماً.
+    يُحدّث s['sync'] فيرى الداشبورد (سطر المزامنة) والتيليغرام (الملخص)
+    نفس حالة الـVM. عند تعذّر التأكيد: SOS عبر Telegram (قناة مستقلة
+    عن الداشبورد) ثم إعادة محاولة تلقائية في الفحص القادم."""
+    if dry_run:
+        return
+    before = st.gist_updated_at()
+    st.save(s)
+    ok = st.verify_gist_changed(before)
+    if not ok:
+        time.sleep(3)
+        st.save(s)
+        ok = st.verify_gist_changed(before)
+    s["sync"] = {
+        "gist_ok": bool(ok),
+        "gist_checked_at": time.time(),
+        "tg_pending": len(s.get("tg_pending") or []),
+    }
+    if not ok:
+        # SOS عبر Telegram فقط (log_alert=False): الداشبورد نفسه هو
+        # المعطوب فلا فائدة من تلويث سجله، والتيليغرام قناة مستقلة
+        alerts.send(
+            "⚠️ <b>تنبيه مزامنة:</b> تعذّر تأكيد وصول الحالة إلى الداشبورد — "
+            "قد ترى أرقاماً متأخرة مؤقتاً. سأعيد المحاولة تلقائياً "
+            "في الفحص القادم.",
+            dry_run, log_alert=False)
+    st.save(s)
 
 
 def ensure_commander():
@@ -1461,6 +1495,9 @@ def _scan(a):
             print("[ops] خطأ في صندوق البريد:", e)
     # الداشبورد ينصت: كل alerts.send يُسجل في الحالة → يُعرض في الداشبورد
     alerts.LOG_HOOK = lambda kind, text: _log_alert(s, kind, text)
+    # الطابور الدائم: الرسائل الفاشلة تنجو من موت العملية (كل فحص عملية
+    # جديدة) — فيبقى Telegram والداشبورد والـVM على خط واحد
+    alerts.PENDING_HOOK = lambda: s.setdefault("tg_pending", [])
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if s["stats"].get("day") != today:
         s["stats"] = {"day": today, "signals_today": 0}
@@ -1478,7 +1515,7 @@ def _scan(a):
     maybe_digest(s, a.dry_run, movers, ctx)
 
     if not a.dry_run:
-        st.save(s)
+        _sync_publish(s, a.dry_run)
     print("تم.")
 
 
@@ -1495,6 +1532,8 @@ def _monitor(a):
     s = st.load()
     # الداشبورد ينصت: كل alerts.send يُسجل في الحالة → يُعرض في الداشبورد
     alerts.LOG_HOOK = lambda kind, text: _log_alert(s, kind, text)
+    # الطابور الدائم: الرسائل الفاشلة تنجو من موت العملية
+    alerts.PENDING_HOOK = lambda: s.setdefault("tg_pending", [])
     update_positions(s, a.dry_run)
     update_paper(s, a.dry_run)
     # موارد الخادم للوحة "موارد الخادم" — قراءة فقط من /proc، بلا مكتبات
@@ -1509,7 +1548,7 @@ def _monitor(a):
     except Exception as _e:
         print("daemon status skipped:", _e)
     if not a.dry_run:
-        st.save(s)
+        _sync_publish(s, a.dry_run)
     print("تم (مراقب).")
 
 

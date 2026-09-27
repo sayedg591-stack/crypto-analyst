@@ -304,10 +304,10 @@ def new_signal_msg(res, verdict):
         f"🛡️ <b>بعد الهدف الأول:</b> وقف الخسارة ينتقل لسعر الدخول — الباقي مؤمّن",
         f"🛑 <b>وقف الخسارة الأولي:</b> {fmt_price(v['sl'])} ← إذا وصل السعر هنا قبل الهدف اخرج فوراً",
         "",
-        f"✅ <b>نسبة النجاح التقديرية:</b> {v['prob']}٪",
+        f"✅ <b>نسبة النجاح التقديرية:</b> {v['prob']}%",
     ]
     if v.get("learned") is not None:
-        lines.append(f"🧠 <i>بناءً على نتائج {v['band']} السابقة: {v['learned']}٪ منها رابحة</i>")
+        lines.append(f"🧠 <i>بناءً على نتائج {v['band']} السابقة: {v['learned']}% منها رابحة</i>")
     lines.append(f"💡 <b>لماذا هذه العملة؟</b> {html.escape(v['reason'])}")
     if v.get("news"):
         lines.append(f"📰 <b>خبر عنها:</b> {html.escape(v['news'][:110])}")
@@ -315,8 +315,8 @@ def new_signal_msg(res, verdict):
         lines.append(f"⚠️ <b>انتبه:</b> {html.escape(v['warn'])}")
     lines += [
         "",
-        f'🔗 <a href="{_safe_url(res.get("pair_url"))}">الرسم البياني</a>',
-        f'💼 <a href="{wallet_link(res)}">تابع هذه الصفقة في المحفظة الوهمية</a>',
+        f"🔗 <a href=\"{_safe_url(res.get('pair_url'))}\">الرسم البياني</a>",
+        f"💼 <a href=\"{wallet_link(res)}\">تابع هذه الصفقة في المحفظة الوهمية</a>",
         "",
         DISCLAIMER,
     ]
@@ -346,9 +346,9 @@ def tp_hit_msg(name, entry, price, level_idx):
     return (
         f"🎯 <b>مبروك! وصل الهدف — {html.escape(name)}</b>\n"
         f"دخلت بسعر: {fmt_price(entry)}\n"
-        f"السعر الآن: {fmt_price(price)} (ربحك: +{gain:.1f}٪)\n"
+        f"السعر الآن: {fmt_price(price)} (ربحك: +{gain:.1f}%)\n"
         f"💡 <b>الخطة:</b> بِع نصف الكمية لتأمين الربح.\n"
-        f"🛡️ <b>وقف الخسارة انتقل الآن لسعر الدخول</b> — النصف المتبقي مؤمّن 100٪: "
+        f"🛡️ <b>وقف الخسارة انتقل الآن لسعر الدخول</b> — النصف المتبقي مؤمّن 100%: "
         f"إما صعود خيالي بلا مخاطرة، أو خروج متعادل."
     )
 
@@ -368,7 +368,7 @@ def all_tp_msg(name, entry, price):
     gain = (price / entry - 1) * 100
     return (
         f"🏆 <b>اكتملت كل الأهداف — {html.escape(name)}</b> 🎉\n"
-        f"من {fmt_price(entry)} إلى {fmt_price(price)} (ربح: +{gain:.1f}٪)\n"
+        f"من {fmt_price(entry)} إلى {fmt_price(price)} (ربح: +{gain:.1f}%)\n"
         f"أحسنت! توقفت عن متابعة هذه الصفقة."
     )
 
@@ -378,20 +378,20 @@ def stop_loss_msg(name, entry, price):
     return (
         f"🛑 <b>اخرج الآن — {html.escape(name)}</b>\n"
         f"السعر نزل تحت وقف الخسارة.\n"
-        f"دخلت بـ: {fmt_price(entry)} → الآن: {fmt_price(price)} (خسارة: -{loss:.1f}٪)\n"
+        f"دخلت بـ: {fmt_price(entry)} → الآن: {fmt_price(price)} (خسارة: -{loss:.1f}%)\n"
         f"💡 <b>نصيحة:</b> اخرج فوراً لحماية ما تبقى. الالتزام بالخطة أهم من صفقة واحدة."
     )
 
 
 def rug_pull_msg(name, entry, price, blacklisted=False):
     """رسالة الانهيار المفاجئ — تُستعمل بدل وقف الخسارة العادي عندما
-    تتجاوز الخسارة 70٪ فجأة (يُرجح سحب سيولة)."""
+    تتجاوز الخسارة 70% فجأة (يُرجح سحب سيولة)."""
     loss = (1 - price / entry) * 100
     bl = ("⛔ تمت إضافة العملة ومطورها إلى القائمة السوداء — "
           "لن تصلك إشارات منه مجدداً.\n" if blacklisted else "")
     return (
         f"🚨 <b>انهيار مفاجئ / سحب سيولة — {html.escape(name)}</b>\n"
-        f"العملة انهارت فجأة (خسارة: -{loss:.1f}٪). هذا ليس وقف خسارة "
+        f"العملة انهارت فجأة (خسارة: -{loss:.1f}%). هذا ليس وقف خسارة "
         f"فنياً — المؤشرات توحي بسحب سيولة (Rug Pull).\n"
         f"دخلت بـ: {fmt_price(entry)} → الآن: {fmt_price(price)}\n"
         f"{bl}"
@@ -406,7 +406,7 @@ def paper_closed_msg(name, pnl_usd, pnl_pct, reason, cash):
     return (
         f"💼 <b>المحفظة الافتراضية: أُغلقت صفقة {html.escape(name)}</b>\n"
         f"السبب: {html.escape(reason)}\n"
-        f"{icon} النتيجة: {pnl_usd:+.2f}$ ({pnl_pct:+.1f}٪)\n"
+        f"{icon} النتيجة: {pnl_usd:+.2f}$ ({pnl_pct:+.1f}%)\n"
         f"💰 الرصيد النقدي الآن: ${cash:.2f}\n"
         f"<i>تجربة وهمية — ليست أموالاً حقيقية.</i>"
     )
@@ -429,10 +429,10 @@ def paper_tp_msg(name, level_idx, sold_pct, proceeds, realized, remaining_pct, c
     pct = int(TAKE_PROFITS[level_idx] * 100)
     return (
         f"🎯 <b>جني جزئي حقيقي — {html.escape(name)}</b>\n"
-        f"وصل الهدف {level_idx + 1} (+{pct}٪) — تم بيع <b>{sold_pct:.0f}٪</b> من الصفقة فعلياً\n"
+        f"وصل الهدف {level_idx + 1} (+{pct}%) — تم بيع <b>{sold_pct:.0f}%</b> من الصفقة فعلياً\n"
         f"💵 عائد البيع: ${proceeds:.2f}\n"
         f"🔒 ربح مُحقق لحد الآن: ${realized:+.2f}\n"
-        f"📌 المتبقي في الصفقة: {remaining_pct:.0f}٪ — وقف الخسارة انتقل لسعر الدخول (مؤمّن 🛡️)\n"
+        f"📌 المتبقي في الصفقة: {remaining_pct:.0f}% — وقف الخسارة انتقل لسعر الدخول (مؤمّن 🛡️)\n"
         f"💰 الرصيد النقدي الآن: ${cash:.2f}\n"
         f"<i>تجربة وهمية — ليست أموالاً حقيقية.</i>"
     )
@@ -453,7 +453,7 @@ def pos_deteriorated_msg(name, entry, price, old_score, new_score):
         pnl = (price / entry - 1) * 100
     except (TypeError, ZeroDivisionError):
         pnl = 0
-    state = f"ربح +{pnl:.1f}٪" if pnl >= 0 else f"خسارة {pnl:.1f}٪"
+    state = f"ربح +{pnl:.1f}%" if pnl >= 0 else f"خسارة {pnl:.1f}%"
     return (
         f"⚠️ <b>انتبه — {html.escape(name)}</b>\n"
         f"المؤشرات ساءت من بعد ما دخلت (النقاط: {old_score} ← {new_score}).\n"
@@ -470,7 +470,7 @@ def unusual_volume_msg(name, chg, mult):
         f"👀 <b>حركة غير عادية: {html.escape(name)}</b> {direction}\n"
         f"حجم التداول في آخر ساعة تضاعف <b>×{mult:.1f}</b> عن المتوسط — "
         f"شي حاجة كتوجد.\n"
-        f"السعر: {chg:+.1f}٪ في 24 ساعة.\n"
+        f"السعر: {chg:+.1f}% في 24 ساعة.\n"
         f"💡 <b>نصيحة:</b> راقبها عن قرب، ولا تدخل إلا بإشارة شراء واضحة."
     )
 
@@ -483,7 +483,7 @@ def digest_msg(date_str, positions, new_signals, movers, ctx):
         icon = "📈" if macro["btc_chg"] >= 0 else "📉"
         check = " ✓" if macro.get("verified") else ""
         btc_price = fmt_usd(macro["btc"]) if macro.get("btc") else "—"
-        lines.append(f"\n{icon} <b>البيتكوين:</b> {btc_price} ({macro['btc_chg']:+.1f}٪ في 24س){check}")
+        lines.append(f"\n{icon} <b>البيتكوين:</b> {btc_price} ({macro['btc_chg']:+.1f}% في 24س){check}")
 
     fng = (ctx or {}).get("fng")
     if fng and fng.get("value") is not None:
@@ -505,7 +505,7 @@ def digest_msg(date_str, positions, new_signals, movers, ctx):
         for p in positions:
             pnl = (p["price"] / p["entry"] - 1) * 100
             icon = "🟢" if pnl >= 0 else "🔴"
-            lines.append(f"{icon} {html.escape(p['name'])}: {pnl:+.1f}٪")
+            lines.append(f"{icon} {html.escape(p['name'])}: {pnl:+.1f}%")
     else:
         lines.append("\n📌 لا صفقات مفتوحة حالياً.")
     lines.append(f"\n🔔 إشارات جديدة اليوم: <b>{new_signals}</b>")
@@ -518,7 +518,7 @@ def digest_msg(date_str, positions, new_signals, movers, ctx):
         lines.append("\n🔥 <b>أكبر تحركات عملات الميم:</b>")
         for sym, chg in movers[:3]:
             icon = "📈" if chg >= 0 else "📉"
-            lines.append(f"{icon} {html.escape(sym)}: {chg:+.1f}٪")
+            lines.append(f"{icon} {html.escape(sym)}: {chg:+.1f}%")
 
     trending = (ctx or {}).get("trending") or []
     if trending:
@@ -532,9 +532,9 @@ def digest_msg(date_str, positions, new_signals, movers, ctx):
             f"\n💼 <b>المحفظة الافتراضية (تجربة):</b>\n"
             f"بدأنا بـ $100 ← القيمة الآن: <b>${paper['total']:.2f}</b> "
             f"(نقد: ${paper['cash']:.2f})\n"
-            f"{icon} الربح/الخسارة: {paper['pnl']:+.2f}$ ({paper['pct']:+.1f}٪)\n"
+            f"{icon} الربح/الخسارة: {paper['pnl']:+.2f}$ ({paper['pct']:+.1f}%)\n"
             f"🏆 الصفقات المغلقة: {paper['closed']} "
-            f"(رابحة: {paper['wins']} • نسبة الفوز: {paper['winrate']:.0f}٪)\n"
+            f"(رابحة: {paper['wins']} • نسبة الفوز: {paper['winrate']:.0f}%)\n"
             f"📌 صفقات وهمية مفتوحة: {paper['open']}"
         )
 
@@ -544,7 +544,7 @@ def digest_msg(date_str, positions, new_signals, movers, ctx):
         for it in news[:4]:
             s = it.get("sentiment", 0)
             icon = "🟢" if s > 0.2 else ("🔴" if s < -0.2 else "⚪")
-            lines.append(f'{icon} <a href="{_safe_url(it.get("link"), "#")}">{html.escape(it["title"][:85])}</a>')
+            lines.append(f"{icon} <a href=\"{_safe_url(it.get('link'), '#')}\">{html.escape(it['title'][:85])}</a>")
 
     # سطر المزامنة: إثبات مرئي أن الثلاثة على خط واحد
     sync = (ctx or {}).get("sync") or {}
