@@ -15,7 +15,7 @@ import time
 
 import requests
 
-from config import PAPER_START_BALANCE
+from config import PAPER_START_BALANCE, STRATEGY_VERSION
 
 PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 GIST_API = "https://api.github.com/gists"
@@ -76,6 +76,8 @@ def _defaults(s):
     s.setdefault("alerted", {})
     s.setdefault("stats", {})
     s.setdefault("history", [])
+    # نسخة الاستراتيجية التي تتعلم منها ذاكرة الخبير (تُحدّث مع كل ترقية)
+    s["strat_version"] = STRATEGY_VERSION
     s.setdefault("waitlist", {})
     s.setdefault("paper", _default_paper())
     # أرشيف الصفقات المغلقة — يُملأ تدريجياً منذ هذا التحديث
@@ -195,15 +197,22 @@ def record_outcome(s, pos, outcome):
         "band": pos.get("band") or "؟",
         "score": pos.get("score"),
         "outcome": outcome,
+        "strat": STRATEGY_VERSION,  # تُحسب في ذاكرة هذه النسخة فقط
         "time": time.time(),
     })
     s["history"] = h[-200:]
 
 
+def _learning_history(s):
+    """سجلات النسخة الحالية فقط — الأرشيف القديم محفوظ لكن لا يُعلَّم عليه."""
+    return [h for h in s.get("history", [])
+            if (h.get("strat") or "v1") == STRATEGY_VERSION]
+
+
 def band_stats(s):
     """لكل فئة نقاط: عدد الإشارات ونسبة التي وصلت لهدف على الأقل."""
     stats = {}
-    for h in s.get("history", []):
+    for h in _learning_history(s):
         b = h.get("band") or "؟"
         d = stats.setdefault(b, {"n": 0, "wins": 0})
         d["n"] += 1
@@ -216,6 +225,6 @@ def band_stats(s):
 
 def track_summary(s, n=10):
     """ملخص آخر n إشارة: كم منها رابحة."""
-    h = s.get("history", [])[-n:]
+    h = _learning_history(s)[-n:]
     wins = sum(1 for x in h if x.get("outcome") in ("tp1", "tp2", "tp3"))
     return {"n": len(h), "wins": wins}
