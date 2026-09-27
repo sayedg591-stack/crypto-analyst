@@ -73,16 +73,20 @@ _session.headers.update({"User-Agent": BROWSER_UA,
                          "Accept": "application/json"})
 
 
-def _get(url, params=None):
+def _get(url, params=None, tries=None):
     """طلب GET — وضع التدوير القاسي (fail-fast):
     - 429 (انتهاء الحصة/حظر مؤقت) = فشل فوري بلا إعادة: السلسلة تنتقل
       للمصدر البديل في نفس اللحظة، والمصدر المحروق يدخل تبريداً ثم يعود.
     - Exponential Backoff يُحفظ لأخطاء 5xx ومشاكل الشبكة فقط (قد تتعافى).
     - الأخطاء الدائمة (404 وغيرها) لا تُعاد — لا فائدة.
-    - _get.last_status يحمل آخر رمز HTTP (0 = خطأ شبكة) لتقرأه السلاسل."""
+    - _get.last_status يحمل آخر رمز HTTP (0 = خطأ شبكة) لتقرأه السلاسل.
+    - tries: عدد المحاولات (الافتراضي BACKOFF_TRIES). داخل سلاسل
+      الـfailover تُستخدم tries=1: المصدر البديل *هو* إعادة المحاولة —
+      لا معنى لإضاعة 30 ثانية على مصدر ميت بينما البديل جاهز."""
     _get.last_status = 0
+    n = BACKOFF_TRIES if tries is None else max(1, int(tries))
     wait = BACKOFF_BASE
-    for _ in range(BACKOFF_TRIES):
+    for _ in range(n):
         try:
             r = _session.get(url, params=params, timeout=REQUEST_TIMEOUT)
             _get.last_status = r.status_code
@@ -237,8 +241,10 @@ def pairs_for_tokens(tokens):
 
 
 def get_pair(chain, pair_address):
-    """يجلب بيانات زوج واحد (لتحديث سعر صفقة مفتوحة)."""
-    data = _get(f"{DEXSCREENER_API}/latest/dex/pairs/{chain}/{pair_address}")
+    """يجلب بيانات زوج واحد (لتحديث سعر صفقة مفتوحة).
+    يُستدعى داخل سلسلة failover فقط → tries=1 (البديل هو إعادة المحاولة)."""
+    data = _get(f"{DEXSCREENER_API}/latest/dex/pairs/{chain}/{pair_address}",
+                tries=1)
     try:
         return data["pairs"][0]
     except Exception:
@@ -247,11 +253,13 @@ def get_pair(chain, pair_address):
 
 def gecko_pool(chain, pool_address):
     """المصدر الاحتياطي الثاني لبيانات الزوج: GeckoTerminal.
-    يعيد قاموساً موحّداً فيه priceUsd وliquidity.usd (أو None)."""
+    يعيد قاموساً موحّداً فيه priceUsd وliquidity.usd (أو None).
+    داخل سلسلة failover → tries=1."""
     net = GECKO_NETWORKS.get(chain)
     if not net:
         return None
-    data = _get(f"{GECKOTERMINAL_API}/networks/{net}/pools/{pool_address}")
+    data = _get(f"{GECKOTERMINAL_API}/networks/{net}/pools/{pool_address}",
+                tries=1)
     try:
         a = data["data"]["attributes"]
         return {"priceUsd": a.get("base_token_price_usd"),
@@ -270,19 +278,91 @@ def gecko_pool(chain, pool_address):
         return None
 
 
+# ---------- كاش أزواج احتياطي (الطبقة الثالثة — «لا تتوقف أبداً») ----------
+# السكانر/المونيتور عمليتان جديدتان كل دقيقة: كاش الذاكرة يموت مع العملية،
+# لذلك هذا الكاش ملف دائم في ~/bot (كتابة ذرية، مثل كاش الأمان).
+# القاعدة: تُخزَّن آخر بيانات زوج صالحة فقط. إذا سقط DexScreener
+# وGeckoTerminal معاً → آخر سعر معروف (موسوم _stale) بدل التوقف.
+_PAIR_CACHE_PATH = os.path.join(os.path.expanduser("~"), "bot",
+                                "pair_cache.json")
+_PAIR_CACHE_MAX = 2000
+_PAIR_CACHE_TTL = 900  # 15 دقيقة — بعدها البيانات قديمة جداً ولا تُستخدم
+
+
+def _pair_cache_load():
+    try:
+        with open(_PAIR_CACHE_PATH, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _pair_cache_save(d):
+    try:
+        os.makedirs(os.path.dirname(_PAIR_CACHE_PATH), exist_ok=True)
+        tmp = _PAIR_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        os.replace(tmp, _PAIR_CACHE_PATH)  # كتابة ذرية
+    except Exception:
+        pass
+
+
+def _pair_cache_store(key, data):
+    """يخزّن آخر بيانات زوج صالحة (تُستدعى عند نجاح السلسلة فقط)."""
+    if not isinstance(data, dict):
+        return
+    try:
+        d = _pair_cache_load()
+        d[key] = {"v": data, "t": time.time()}
+        if len(d) > _PAIR_CACHE_MAX:
+            old = sorted(d.items(), key=lambda kv: kv[1].get("t", 0))
+            for k, _ in old[: len(d) - _PAIR_CACHE_MAX]:
+                d.pop(k, None)
+        _pair_cache_save(d)
+    except Exception:
+        pass
+
+
+def _pair_cache_hit(key):
+    """يعيد آخر بيانات صالحة موسومة _stale إذا كانت ضمن المهلة، وإلا None."""
+    try:
+        ent = _pair_cache_load().get(key)
+        if isinstance(ent, dict) and isinstance(ent.get("v"), dict):
+            if time.time() - float(ent.get("t", 0)) <= _PAIR_CACHE_TTL:
+                d = dict(ent["v"])
+                d["_stale"] = True
+                return d
+    except Exception:
+        pass
+    return None
+
+
 def pair_chain(s, chain, pair_address):
-    """سلسلة بيانات الزوج: DexScreener → GeckoTerminal.
-    إذا انتهى حدّ الأول أو سقط → الثاني يشتغل تلقائياً."""
+    """سلسلة بيانات الزوج (3 طبقات — لا تتوقف أبداً):
+    1) DexScreener → 2) GeckoTerminal → 3) آخر بيانات صالحة مخزنة.
+    إذا سقط الأول أو الثاني → التالي يشتغل فوراً (tries=1 داخل السلسلة).
+    إذا سقط الاثنان معاً → الكاش الاحتياطي (موسوم _stale، بحد 15 دقيقة)
+    حتى تبقى الصفقات المفتوحة مُدارة بدل أن يتجمد البوت."""
     def _has_price(d):
         try:
             return float((d or {}).get("priceUsd") or 0) > 0
         except (TypeError, ValueError):
             return False
-    return chain_try(
+    data, src = chain_try(
         s, "pair",
         [("dexscreener", lambda: get_pair(chain, pair_address)),
          ("geckoterminal", lambda: gecko_pool(chain, pair_address))],
         need=_has_price)
+    key = f"{chain}:{pair_address}"
+    if data is not None:
+        _pair_cache_store(key, data)
+        return data, src
+    stale = _pair_cache_hit(key)
+    if stale is not None:
+        return stale, "cache"
+    return None, None
 
 
 # ---------- فحص أمان العقد (مجاني) ----------
@@ -465,9 +545,14 @@ def _token_security_live(chain, address):
 
 
 def token_security(chain, address):
-    """فحص أمان العقد مع كاش دائم: honeypot.is / RugCheck تُستدعى
-    للعناوين الجديدة فقط — العناوين المفحوصة خلال 6 ساعات تُقرأ من الكاش
-    (0 طلبات API). الفشل لا يُخزَّن: fail-closed محفوظ."""
+    """فحص أمان العقد مع كاش دائم (3 طبقات — لا تتوقف أبداً):
+    1) honeypot.is (لـ EVM) / RugCheck (لـ Solana)،
+    2) GoPlus كبديل تلقائي عند فشل الأول،
+    3) safe-skip: إذا فشل المصدران معاً تبقى fail-closed — العملة غير
+       القابلة للتحقق تُرفض مع السبب الدقيق (LAST_SEC_ERROR)، والفحص
+       يكمل فوراً للعملة التالية. البوت لا يتوقف أبداً بسبب API أمان.
+    العناوين المفحوصة خلال 6 ساعات تُقرأ من الكاش (0 طلبات API).
+    الفشل لا يُخزَّن: fail-closed محفوظ."""
     key = f"{chain}:{(address or '').lower()}"
     hit = _sec_cached(key, "token_security")
     if hit is not None:
@@ -565,8 +650,9 @@ def rugcheck_creator(mint):
 
 
 # ---------- Binance (بيانات عمومية) ----------
-def binance_ticker(symbol):
-    return _get(f"{BINANCE_API}/api/v3/ticker/24hr", params={"symbol": symbol})
+def binance_ticker(symbol, tries=None):
+    return _get(f"{BINANCE_API}/api/v3/ticker/24hr", params={"symbol": symbol},
+                tries=tries)
 
 
 def binance_klines(symbol, interval="1h", limit=24):
@@ -590,8 +676,9 @@ from config import (COINGECKO_API, NEWS_FEEDS, NEWS_LOOKBACK_HOURS,
 
 
 def coingecko_trending():
-    """العملات الرائجة الآن على CoinGecko (اكتشاف مبكر للاهتمام)."""
-    data = _get(f"{COINGECKO_API}/search/trending")
+    """العملات الرائجة الآن على CoinGecko (اكتشاف مبكر للاهتمام).
+    داخل سلسلة failover → tries=1."""
+    data = _get(f"{COINGECKO_API}/search/trending", tries=1)
     out = []
     try:
         for c in data["coins"]:
@@ -606,8 +693,9 @@ def coingecko_trending():
 
 def coinpaprika_trending():
     """المصدر الاحتياطي الثاني للعملات الرائجة: CoinPaprika (بلا مفتاح).
-    يرتب أكبر 100 عملة حسب تغير 24 ساعة ويعيد أول 10."""
-    data = _get(f"{COINPAPRIKA_API}/tickers", params={"limit": 100})
+    يرتب أكبر 100 عملة حسب تغير 24 ساعة ويعيد أول 10.
+    داخل سلسلة failover → tries=1."""
+    data = _get(f"{COINPAPRIKA_API}/tickers", params={"limit": 100}, tries=1)
     if not isinstance(data, list):
         return []
     rows = []
@@ -624,20 +712,49 @@ def coinpaprika_trending():
     return [r[1] for r in rows[:10]]
 
 
+def dex_boosts_trending():
+    """المصدر الاحتياطي الثالث للعملات الرائجة: أعلى العملات ترويجاً
+    على DexScreener (بلا مفتاح). الـboosts لا تحمل الرمز مباشرة،
+    لذلك تُحل الرموز عبر endpoint الدفعات الموجود أصلاً.
+    تُستدعى فقط إذا سقط CoinGecko وCoinPaprika معاً."""
+    try:
+        boosts = top_boosts()[:10]
+        if not boosts:
+            return []
+        pairs = pairs_for_tokens(boosts)
+        seen, out = set(), []
+        for p in pairs:
+            try:
+                bt = p.get("baseToken") or {}
+                sym = str(bt.get("symbol") or "").upper()
+                if sym and sym not in seen:
+                    seen.add(sym)
+                    out.append({"symbol": sym, "name": bt.get("name", "")})
+            except Exception:
+                continue
+        return out[:10]
+    except Exception:
+        return []
+
+
 def trending_chain(s):
-    """سلسلة «الرائجة الآن»: CoinGecko → CoinPaprika."""
+    """سلسلة «الرائجة الآن» (3 طبقات): CoinGecko → CoinPaprika →
+    DexScreener boosts. إذا سقط الأول أو الثاني → التالي يشتغل فوراً."""
     return chain_try(
         s, "trending",
         [("coingecko", coingecko_trending),
-         ("coinpaprika", coinpaprika_trending)],
+         ("coinpaprika", coinpaprika_trending),
+         ("dexboosts", dex_boosts_trending)],
         need=lambda d: len(d or []) > 0)
 
 
 def coingecko_macro():
-    """نبض السوق العام: سعر BTC وتغير 24س لـ BTC/ETH."""
+    """نبض السوق العام: سعر BTC وتغير 24س لـ BTC/ETH.
+    يُستدعى داخل التصويت فقط → tries=1."""
     data = _get(f"{COINGECKO_API}/simple/price",
                 params={"ids": "bitcoin,ethereum", "vs_currencies": "usd",
-                        "include_24hr_change": "true"})
+                        "include_24hr_change": "true"},
+                tries=1)
     if not isinstance(data, dict):
         return None
     try:
@@ -652,8 +769,9 @@ def coingecko_macro():
 
 def kraken_btc():
     """المصدر الاحتياطي الثالث لنبض BTC: Kraken العام (بلا مفتاح).
-    يعيد {"btc": السعر، "btc_chg": تغير 24س محسوب من متوسط السعر}."""
-    data = _get(f"{KRAKEN_API}/Ticker", params={"pair": "XBTUSD"})
+    يعيد {"btc": السعر، "btc_chg": تغير 24س محسوب من متوسط السعر}.
+    يُستدعى داخل التصويت فقط → tries=1."""
+    data = _get(f"{KRAKEN_API}/Ticker", params={"pair": "XBTUSD"}, tries=1)
     try:
         t = data["result"]["XXBTZUSD"]
         last = float(t["c"][0])
@@ -689,20 +807,38 @@ def fear_greed():
         return None
 
 
+def coinpaprika_btc():
+    """المصدر الاحتياطي الرابع لنبض BTC: CoinPaprika (بلا مفتاح).
+    يعيد {"btc": السعر، "btc_chg": تغير 24س}. يُستدعى داخل التصويت
+    فقط → tries=1."""
+    data = _get(f"{COINPAPRIKA_API}/tickers/btc-bitcoin", tries=1)
+    try:
+        q = data["quotes"]["USD"]
+        return {"btc": float(q["price"]),
+                "btc_chg": float(q.get("percent_change_24h") or 0)}
+    except Exception:
+        return None
+
+
 def verified_macro():
-    """نبض السوق مع التحقق المتبادل بين 3 مصادر: CoinGecko وBinance وKraken.
-    إذا اتفق مصدران على الأقل (ضمن MACRO_VERIFY_MAX_DIFF) → الرقم موثوق.
-    مصدر واحد فقط → يُستخدم دون توثيق. إذا سقط مصدر → الآخران يغطيانه."""
+    """نبض السوق مع التحقق المتبادل بين 4 مصادر: CoinGecko وBinance
+    وKraken وCoinPaprika. إذا اتفق مصدران على الأقل
+    (ضمن MACRO_VERIFY_MAX_DIFF) → الرقم موثوق. مصدر واحد فقط →
+    يُستخدم دون توثيق. إذا سقط مصدر أو اثنان → البقية تغطيها —
+    البوت لا يتوقف أبداً."""
     cg = coingecko_macro()
     cg_chg = (cg or {}).get("btc_chg")
     bn_chg = None
     try:
-        bn_chg = float((binance_ticker("BTCUSDT") or {}).get("priceChangePercent"))
+        bn_chg = float((binance_ticker("BTCUSDT", tries=1) or {})
+                       .get("priceChangePercent"))
     except (TypeError, ValueError):
         bn_chg = None
     kb = kraken_btc()
     kb_chg = (kb or {}).get("btc_chg")
-    votes = [c for c in (cg_chg, bn_chg, kb_chg) if c is not None]
+    cp = coinpaprika_btc()
+    cp_chg = (cp or {}).get("btc_chg")
+    votes = [c for c in (cg_chg, bn_chg, kb_chg, cp_chg) if c is not None]
     btc_chg, verified = None, False
     if len(votes) >= 2:
         # أغلبية متفقة: ابحث عن زوج متفق ضمن الحد
@@ -720,11 +856,12 @@ def verified_macro():
     elif votes:
         btc_chg = votes[0]
     return {
-        "btc": (cg or {}).get("btc") or (kb or {}).get("btc"),
+        "btc": (cg or {}).get("btc") or (kb or {}).get("btc")
+               or (cp or {}).get("btc"),
         "btc_chg": btc_chg,
         "eth_chg": (cg or {}).get("eth_chg"),
         "verified": verified,
-        "macro_sources": sum(1 for c in (cg_chg, bn_chg, kb_chg)
+        "macro_sources": sum(1 for c in (cg_chg, bn_chg, kb_chg, cp_chg)
                              if c is not None),
     }
 

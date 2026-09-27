@@ -506,29 +506,35 @@ def scan_new_coins(s, dry_run, ctx):
 
     results = []
     for p in cands:
-        chain = p.get("chainId")
-        addr = (p.get("baseToken") or {}).get("address")
-        # فحص السلامة: زوج بلا سعر = بيانات ناقصة — يُتجاهل (لا قرارات على فراغ)
-        if not analyzer._f(p.get("priceUsd")):
+        # حارس «لا تتوقف أبداً»: عملة واحدة فاسدة/استثناء غير متوقع
+        # يجب ألا يقتل الفحص كله — تُسجَّل ويُكمل للعملة التالية.
+        try:
+            chain = p.get("chainId")
+            addr = (p.get("baseToken") or {}).get("address")
+            # فحص السلامة: زوج بلا سعر = بيانات ناقصة — يُتجاهل (لا قرارات على فراغ)
+            if not analyzer._f(p.get("priceUsd")):
+                continue
+            boosted = (chain, (addr or "").lower()) in boosted_set
+            sec = clients.token_security(chain, addr) if addr else None
+            # الافتراض الآمن: فشل فحص الأمان لعملة بعنوان معروف = مرفوضة
+            sec_failed = bool(addr) and sec is None
+            # سبب الفشل الحقيقي (إن وُجد) — يظهر في السجل بدل التخمين
+            sec_err = getattr(clients, "LAST_SEC_ERROR", None) if sec_failed else None
+            # 🐋 فحص تركيز الحيتان (Solana فقط — مجاني بلا مفتاح عبر RugCheck)
+            holders = (clients.solana_top10_pct(addr)
+                       if (chain == "solana" and addr) else None)
+            res = analyzer.analyze_pair(p, sec, boosted=boosted, holders=holders,
+                                        security_unknown=sec_failed,
+                                        security_error=sec_err)
+            res["id"] = f"dex:{chain}:{p.get('pairAddress')}"
+            res["kind"] = "dex"
+            res["chain"] = chain
+            res["pair"] = p.get("pairAddress")
+            res["mint"] = addr
+            results.append(res)
+        except Exception as _e:
+            print(f"  ⚠️ عملة متخطاة (خطأ غير متوقع): {_e}")
             continue
-        boosted = (chain, (addr or "").lower()) in boosted_set
-        sec = clients.token_security(chain, addr) if addr else None
-        # الافتراض الآمن: فشل فحص الأمان لعملة بعنوان معروف = مرفوضة
-        sec_failed = bool(addr) and sec is None
-        # سبب الفشل الحقيقي (إن وُجد) — يظهر في السجل بدل التخمين
-        sec_err = getattr(clients, "LAST_SEC_ERROR", None) if sec_failed else None
-        # 🐋 فحص تركيز الحيتان (Solana فقط — مجاني بلا مفتاح عبر RugCheck)
-        holders = (clients.solana_top10_pct(addr)
-                   if (chain == "solana" and addr) else None)
-        res = analyzer.analyze_pair(p, sec, boosted=boosted, holders=holders,
-                                    security_unknown=sec_failed,
-                                    security_error=sec_err)
-        res["id"] = f"dex:{chain}:{p.get('pairAddress')}"
-        res["kind"] = "dex"
-        res["chain"] = chain
-        res["pair"] = p.get("pairAddress")
-        res["mint"] = addr
-        results.append(res)
 
     results.sort(key=lambda r: r["score"], reverse=True)
     sent = 0
@@ -1123,11 +1129,16 @@ def paper_summary(s):
 
 def current_price(s, pos):
     """السعر الحالي عبر سلسلة احتياطية: DexScreener → GeckoTerminal →
-    (لـ Solana) Jupiter. إذا سقط مصدر → التالي يشتغل تلقائياً."""
+    كاش مخزّن (طبقة ثالثة) → (لـ Solana) Jupiter.
+    إذا سقط مصدر → التالي يشتغل تلقائياً."""
     try:
         if pos["kind"] == "dex":
             p, _src = clients.pair_chain(s, pos["chain"], pos["pair"])
             if p:
+                if p.get("_stale"):
+                    print(f"  ⚠️ كاش احتياطي ({_src}) لسعر "
+                          f"{str(pos.get('pair') or '?')[:14]} — "
+                          f"المصدران الحيان ساقطان مؤقتاً")
                 return (float(p.get("priceUsd") or 0),
                         float((p.get("liquidity") or {}).get("usd") or 0))
             # الملاذ الأخير لعملات Solana: سعر Jupiter المباشر
