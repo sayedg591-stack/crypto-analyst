@@ -37,6 +37,63 @@ def wallet_link(res):
 # المستخدم، ويجب أن يبقى كذلك حتى بعد إعادة الإرسال من الطابور.
 _PENDING = []
 
+# خطاف الطابور الدائم: يضبطه main.py ليعيد قائمة s["tg_pending"] —
+# هكذا تنجو الرسائل الفاشلة من موت العملية (كل فحص عملية جديدة تُولد
+# وتموت) وتُرسَل في الفحص اللاحق، فيبقى Telegram والداشبورد على خط واحد.
+# بلا خطاف: السلوك القديم (طابور ذاكرة فقط).
+PENDING_HOOK = None
+
+# أقصى عمر لرسالة معلقة: بعد 24 ساعة تُسقط (تنبيه "اشترِ الآن" يصل بعد
+# يوم أخطر من فقدانه — والحدث نفسه يبقى في سجل التنبيهات).
+PENDING_TTL = 24 * 3600
+
+
+def _persisted():
+    """قائمة الطابور الدائم من الحالة، أو None عند غياب الخطاف."""
+    if PENDING_HOOK is None:
+        return None
+    try:
+        q = PENDING_HOOK()
+        return q if isinstance(q, list) else None
+    except Exception:
+        return None
+
+
+def _flush_persisted(token, chat):
+    """تصريف الطابور الدائم (المحفوظ في الـGist) قبل أي إرسال جديد —
+    أول رسالة تصل أولاً. الرسالة المرفوضة نهائياً (غير قابلة لإعادة
+    المحاولة) تُسقط حتى لا تسمّم الطابور."""
+    q = _persisted()
+    if not q:
+        return
+    now = time.time()
+    q[:] = [it for it in q
+            if isinstance(it, dict) and now - it.get("ts", now) < PENDING_TTL]
+    while q:
+        it = q[0]
+        ok, retryable = _post_message(token, chat, it.get("text", ""))
+        if not ok:
+            if not retryable:
+                print("  -> رسالة معلقة مرفوضة نهائياً — إسقاطها")
+                q.pop(0)
+                continue
+            break
+        q.pop(0)
+        if it.get("log", True):
+            _log_sent(it["text"])  # وصلت فعلاً الآن → تُسجل (مرة واحدة فقط)
+        print(f"  -> أُعيد إرسال رسالة معلقة من الطابور الدائم "
+              f"(متبقٍ: {len(q)})")
+
+
+def pending_count():
+    """عدد الرسائل المعلقة (ذاكرة + دائم) — لحالة المزامنة في الداشبورد."""
+    n = len(_PENDING)
+    q = _persisted()
+    if q:
+        n += len(q)
+    return n
+
+
 # خطاف سجل التنبيهات: يضبطه main.py ليحفظ كل تنبيه في الحالة (state)
 # فيُعرض في الداشبورد — هكذا "ينصت" الداشبورد لكل ما يُرسل إلى Telegram
 # دون أن يقرأ Telegram نفسه (الاتجاه: البوت → Gist → الداشبورد).
@@ -140,6 +197,7 @@ def send(text, dry_run=False, log_alert=True):
         print("—" * 45)
         return False
     _flush_pending(token, chat)
+    _flush_persisted(token, chat)  # الطابور الدائم أولاً — الأقدم يُرسَل أولاً
     wait = TG_RETRY_BASE
     for attempt in range(TG_MAX_RETRIES):
         ok, retryable = _post_message(token, chat, text)
@@ -152,15 +210,24 @@ def send(text, dry_run=False, log_alert=True):
         time.sleep(wait)
         wait *= 2
     # فشل كل المحاولات: تُحفظ في الطابور (بحد أقصى) بدل الضياع —
-    # مع الاحتفاظ بخيار log_alert ليلتزم به الإرسال اللاحق
-    item = (text, log_alert)
-    if len(_PENDING) < TG_PENDING_MAX:
-        _PENDING.append(item)
+    # مع الاحتفاظ بخيار log_alert ليلتزم به الإرسال اللاحق.
+    # الطابور الدائم (في الـGist) ينجو من موت العملية — كل فحص عملية جديدة.
+    q = _persisted()
+    if q is not None:
+        q.append({"text": text, "log": log_alert, "ts": time.time()})
+        if len(q) > TG_PENDING_MAX:
+            del q[:len(q) - TG_PENDING_MAX]
+        print(f"[!] تعذّر إرسال التنبيه بعد {TG_MAX_RETRIES} محاولات — "
+              f"حُفظ في الطابور الدائم ({len(q)} معلقة)")
     else:
-        _PENDING.pop(0)
-        _PENDING.append(item)
-    print(f"[!] تعذّر إرسال التنبيه بعد {TG_MAX_RETRIES} محاولات — "
-          f"حُفظ في الطابور ({len(_PENDING)} معلقة)")
+        item = (text, log_alert)
+        if len(_PENDING) < TG_PENDING_MAX:
+            _PENDING.append(item)
+        else:
+            _PENDING.pop(0)
+            _PENDING.append(item)
+        print(f"[!] تعذّر إرسال التنبيه بعد {TG_MAX_RETRIES} محاولات — "
+              f"حُفظ في الطابور ({len(_PENDING)} معلقة)")
     return False
 
 
@@ -237,10 +304,10 @@ def new_signal_msg(res, verdict):
         f"🛡️ <b>بعد الهدف الأول:</b> وقف الخسارة ينتقل لسعر الدخول — الباقي مؤمّن",
         f"🛑 <b>وقف الخسارة الأولي:</b> {fmt_price(v['sl'])} ← إذا وصل السعر هنا قبل الهدف اخرج فوراً",
         "",
-        f"✅ <b>نسبة النجاح التقديرية:</b> {v['prob']}%",
+        f"✅ <b>نسبة النجاح التقديرية:</b> {v['prob']}٪",
     ]
     if v.get("learned") is not None:
-        lines.append(f"🧠 <i>بناءً على نتائج {v['band']} السابقة: {v['learned']}% منها رابحة</i>")
+        lines.append(f"🧠 <i>بناءً على نتائج {v['band']} السابقة: {v['learned']}٪ منها رابحة</i>")
     lines.append(f"💡 <b>لماذا هذه العملة؟</b> {html.escape(v['reason'])}")
     if v.get("news"):
         lines.append(f"📰 <b>خبر عنها:</b> {html.escape(v['news'][:110])}")
@@ -248,8 +315,8 @@ def new_signal_msg(res, verdict):
         lines.append(f"⚠️ <b>انتبه:</b> {html.escape(v['warn'])}")
     lines += [
         "",
-        f"🔗 <a href=\"{_safe_url(res.get('pair_url'))}\">الرسم البياني</a>",
-        f"💼 <a href=\"{wallet_link(res)}\">تابع هذه الصفقة في المحفظة الوهمية</a>",
+        f'🔗 <a href="{_safe_url(res.get("pair_url"))}">الرسم البياني</a>',
+        f'💼 <a href="{wallet_link(res)}">تابع هذه الصفقة في المحفظة الوهمية</a>',
         "",
         DISCLAIMER,
     ]
@@ -279,9 +346,9 @@ def tp_hit_msg(name, entry, price, level_idx):
     return (
         f"🎯 <b>مبروك! وصل الهدف — {html.escape(name)}</b>\n"
         f"دخلت بسعر: {fmt_price(entry)}\n"
-        f"السعر الآن: {fmt_price(price)} (ربحك: +{gain:.1f}%)\n"
+        f"السعر الآن: {fmt_price(price)} (ربحك: +{gain:.1f}٪)\n"
         f"💡 <b>الخطة:</b> بِع نصف الكمية لتأمين الربح.\n"
-        f"🛡️ <b>وقف الخسارة انتقل الآن لسعر الدخول</b> — النصف المتبقي مؤمّن 100%: "
+        f"🛡️ <b>وقف الخسارة انتقل الآن لسعر الدخول</b> — النصف المتبقي مؤمّن 100٪: "
         f"إما صعود خيالي بلا مخاطرة، أو خروج متعادل."
     )
 
@@ -301,7 +368,7 @@ def all_tp_msg(name, entry, price):
     gain = (price / entry - 1) * 100
     return (
         f"🏆 <b>اكتملت كل الأهداف — {html.escape(name)}</b> 🎉\n"
-        f"من {fmt_price(entry)} إلى {fmt_price(price)} (ربح: +{gain:.1f}%)\n"
+        f"من {fmt_price(entry)} إلى {fmt_price(price)} (ربح: +{gain:.1f}٪)\n"
         f"أحسنت! توقفت عن متابعة هذه الصفقة."
     )
 
@@ -311,20 +378,20 @@ def stop_loss_msg(name, entry, price):
     return (
         f"🛑 <b>اخرج الآن — {html.escape(name)}</b>\n"
         f"السعر نزل تحت وقف الخسارة.\n"
-        f"دخلت بـ: {fmt_price(entry)} → الآن: {fmt_price(price)} (خسارة: -{loss:.1f}%)\n"
+        f"دخلت بـ: {fmt_price(entry)} → الآن: {fmt_price(price)} (خسارة: -{loss:.1f}٪)\n"
         f"💡 <b>نصيحة:</b> اخرج فوراً لحماية ما تبقى. الالتزام بالخطة أهم من صفقة واحدة."
     )
 
 
 def rug_pull_msg(name, entry, price, blacklisted=False):
     """رسالة الانهيار المفاجئ — تُستعمل بدل وقف الخسارة العادي عندما
-    تتجاوز الخسارة 70% فجأة (يُرجح سحب سيولة)."""
+    تتجاوز الخسارة 70٪ فجأة (يُرجح سحب سيولة)."""
     loss = (1 - price / entry) * 100
     bl = ("⛔ تمت إضافة العملة ومطورها إلى القائمة السوداء — "
           "لن تصلك إشارات منه مجدداً.\n" if blacklisted else "")
     return (
         f"🚨 <b>انهيار مفاجئ / سحب سيولة — {html.escape(name)}</b>\n"
-        f"العملة انهارت فجأة (خسارة: -{loss:.1f}%). هذا ليس وقف خسارة "
+        f"العملة انهارت فجأة (خسارة: -{loss:.1f}٪). هذا ليس وقف خسارة "
         f"فنياً — المؤشرات توحي بسحب سيولة (Rug Pull).\n"
         f"دخلت بـ: {fmt_price(entry)} → الآن: {fmt_price(price)}\n"
         f"{bl}"
@@ -339,7 +406,7 @@ def paper_closed_msg(name, pnl_usd, pnl_pct, reason, cash):
     return (
         f"💼 <b>المحفظة الافتراضية: أُغلقت صفقة {html.escape(name)}</b>\n"
         f"السبب: {html.escape(reason)}\n"
-        f"{icon} النتيجة: {pnl_usd:+.2f}$ ({pnl_pct:+.1f}%)\n"
+        f"{icon} النتيجة: {pnl_usd:+.2f}$ ({pnl_pct:+.1f}٪)\n"
         f"💰 الرصيد النقدي الآن: ${cash:.2f}\n"
         f"<i>تجربة وهمية — ليست أموالاً حقيقية.</i>"
     )
@@ -362,10 +429,10 @@ def paper_tp_msg(name, level_idx, sold_pct, proceeds, realized, remaining_pct, c
     pct = int(TAKE_PROFITS[level_idx] * 100)
     return (
         f"🎯 <b>جني جزئي حقيقي — {html.escape(name)}</b>\n"
-        f"وصل الهدف {level_idx + 1} (+{pct}%) — تم بيع <b>{sold_pct:.0f}%</b> من الصفقة فعلياً\n"
+        f"وصل الهدف {level_idx + 1} (+{pct}٪) — تم بيع <b>{sold_pct:.0f}٪</b> من الصفقة فعلياً\n"
         f"💵 عائد البيع: ${proceeds:.2f}\n"
         f"🔒 ربح مُحقق لحد الآن: ${realized:+.2f}\n"
-        f"📌 المتبقي في الصفقة: {remaining_pct:.0f}% — وقف الخسارة انتقل لسعر الدخول (مؤمّن 🛡️)\n"
+        f"📌 المتبقي في الصفقة: {remaining_pct:.0f}٪ — وقف الخسارة انتقل لسعر الدخول (مؤمّن 🛡️)\n"
         f"💰 الرصيد النقدي الآن: ${cash:.2f}\n"
         f"<i>تجربة وهمية — ليست أموالاً حقيقية.</i>"
     )
@@ -386,7 +453,7 @@ def pos_deteriorated_msg(name, entry, price, old_score, new_score):
         pnl = (price / entry - 1) * 100
     except (TypeError, ZeroDivisionError):
         pnl = 0
-    state = f"ربح +{pnl:.1f}%" if pnl >= 0 else f"خسارة {pnl:.1f}%"
+    state = f"ربح +{pnl:.1f}٪" if pnl >= 0 else f"خسارة {pnl:.1f}٪"
     return (
         f"⚠️ <b>انتبه — {html.escape(name)}</b>\n"
         f"المؤشرات ساءت من بعد ما دخلت (النقاط: {old_score} ← {new_score}).\n"
@@ -403,7 +470,7 @@ def unusual_volume_msg(name, chg, mult):
         f"👀 <b>حركة غير عادية: {html.escape(name)}</b> {direction}\n"
         f"حجم التداول في آخر ساعة تضاعف <b>×{mult:.1f}</b> عن المتوسط — "
         f"شي حاجة كتوجد.\n"
-        f"السعر: {chg:+.1f}% في 24 ساعة.\n"
+        f"السعر: {chg:+.1f}٪ في 24 ساعة.\n"
         f"💡 <b>نصيحة:</b> راقبها عن قرب، ولا تدخل إلا بإشارة شراء واضحة."
     )
 
@@ -416,7 +483,7 @@ def digest_msg(date_str, positions, new_signals, movers, ctx):
         icon = "📈" if macro["btc_chg"] >= 0 else "📉"
         check = " ✓" if macro.get("verified") else ""
         btc_price = fmt_usd(macro["btc"]) if macro.get("btc") else "—"
-        lines.append(f"\n{icon} <b>البيتكوين:</b> {btc_price} ({macro['btc_chg']:+.1f}% في 24س){check}")
+        lines.append(f"\n{icon} <b>البيتكوين:</b> {btc_price} ({macro['btc_chg']:+.1f}٪ في 24س){check}")
 
     fng = (ctx or {}).get("fng")
     if fng and fng.get("value") is not None:
@@ -438,7 +505,7 @@ def digest_msg(date_str, positions, new_signals, movers, ctx):
         for p in positions:
             pnl = (p["price"] / p["entry"] - 1) * 100
             icon = "🟢" if pnl >= 0 else "🔴"
-            lines.append(f"{icon} {html.escape(p['name'])}: {pnl:+.1f}%")
+            lines.append(f"{icon} {html.escape(p['name'])}: {pnl:+.1f}٪")
     else:
         lines.append("\n📌 لا صفقات مفتوحة حالياً.")
     lines.append(f"\n🔔 إشارات جديدة اليوم: <b>{new_signals}</b>")
@@ -451,7 +518,7 @@ def digest_msg(date_str, positions, new_signals, movers, ctx):
         lines.append("\n🔥 <b>أكبر تحركات عملات الميم:</b>")
         for sym, chg in movers[:3]:
             icon = "📈" if chg >= 0 else "📉"
-            lines.append(f"{icon} {html.escape(sym)}: {chg:+.1f}%")
+            lines.append(f"{icon} {html.escape(sym)}: {chg:+.1f}٪")
 
     trending = (ctx or {}).get("trending") or []
     if trending:
@@ -465,9 +532,9 @@ def digest_msg(date_str, positions, new_signals, movers, ctx):
             f"\n💼 <b>المحفظة الافتراضية (تجربة):</b>\n"
             f"بدأنا بـ $100 ← القيمة الآن: <b>${paper['total']:.2f}</b> "
             f"(نقد: ${paper['cash']:.2f})\n"
-            f"{icon} الربح/الخسارة: {paper['pnl']:+.2f}$ ({paper['pct']:+.1f}%)\n"
+            f"{icon} الربح/الخسارة: {paper['pnl']:+.2f}$ ({paper['pct']:+.1f}٪)\n"
             f"🏆 الصفقات المغلقة: {paper['closed']} "
-            f"(رابحة: {paper['wins']} • نسبة الفوز: {paper['winrate']:.0f}%)\n"
+            f"(رابحة: {paper['wins']} • نسبة الفوز: {paper['winrate']:.0f}٪)\n"
             f"📌 صفقات وهمية مفتوحة: {paper['open']}"
         )
 
@@ -477,7 +544,18 @@ def digest_msg(date_str, positions, new_signals, movers, ctx):
         for it in news[:4]:
             s = it.get("sentiment", 0)
             icon = "🟢" if s > 0.2 else ("🔴" if s < -0.2 else "⚪")
-            lines.append(f"{icon} <a href=\"{_safe_url(it.get('link'), '#')}\">{html.escape(it['title'][:85])}</a>")
+            lines.append(f'{icon} <a href="{_safe_url(it.get("link"), "#")}">{html.escape(it["title"][:85])}</a>')
+
+    # سطر المزامنة: إثبات مرئي أن الثلاثة على خط واحد
+    sync = (ctx or {}).get("sync") or {}
+    if sync.get("gist_ok") and not sync.get("tg_pending"):
+        lines.append("\n🔗 <b>المزامنة:</b> التيليغرام والداشبورد والسيرفر على خط واحد ✓")
+    elif sync:
+        parts = []
+        parts.append("الداشبورد ✓" if sync.get("gist_ok") else "الداشبورد ⚠")
+        pend = sync.get("tg_pending") or 0
+        parts.append(f"تيليغرام ({pend} معلقة) ⚠" if pend else "تيليغرام ✓")
+        lines.append("\n🔗 <b>المزامنة:</b> " + " · ".join(parts))
 
     lines.append("\n" + DISCLAIMER)
     return "\n".join(lines)
