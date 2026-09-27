@@ -205,6 +205,14 @@ HONEYPOT_CHAIN_IDS = {
     "base": 8453, "arbitrum": 42161, "optimism": 10,
 }
 
+# GoPlus — مصدر احتياطي لفحص أمان العقود (مجاني، بلا مفتاح، EVM + Solana)
+GOPLUS_API = "https://api.gopluslabs.io"
+GOPLUS_CHAIN_IDS = {
+    "ethereum": "1", "bsc": "56", "polygon": "137",
+    "base": "8453", "arbitrum": "42161", "optimism": "10",
+    "solana": "solana",
+}
+
 REQUEST_TIMEOUT = 10   # مهلة صارمة: أي API لا يرد في 10 ثوانٍ = فاشل (بلا تعليق)
 USER_AGENT = "memecoin-analyst/1.0 (free-tier)"
 # بصمة متصفح حقيقي: بعض الـAPIs تحظر عناوين البوتات المعروفة (429)

@@ -8,6 +8,7 @@ import json
 import requests
 from config import (
     DEXSCREENER_API, HONEYPOT_API, HONEYPOT_CHAIN_IDS, RUGCHECK_API,
+    GOPLUS_API, GOPLUS_CHAIN_IDS,
     BINANCE_API, CHAINS, REQUEST_TIMEOUT, USER_AGENT, BROWSER_UA,
     BACKOFF_TRIES, BACKOFF_BASE, GECKOTERMINAL_API, GECKO_NETWORKS,
     GECKO_POOL_LIMIT, REDDIT_SUBS, REDDIT_LIMIT,
@@ -344,30 +345,68 @@ def _sec_store(key, section, value):
         pass
 
 
+def _goplus_pct(x):
+    """ضرائب GoPlus قد تأتي ككسر عشري (0.02) أو كنسبة (2) — نوحّدها كنسبة مئوية."""
+    v = _num(x)
+    return v * 100 if 0 < v <= 1 else v
+
+
+def _goplus_security(chain, address):
+    """GoPlus token_security — مجاني بلا مفتاح، يدعم EVM وسولانا.
+    مصدر احتياطي: يُستدعى فقط عند فشل المصدر الأساسي
+    (honeypot.is / RugCheck) — فلسفة التدوير القاسي: الفشل الفوري
+    ينتقل للبديل في نفس اللحظة بدل رفض العملة."""
+    gid = GOPLUS_CHAIN_IDS.get(chain)
+    if not gid or not address:
+        return None
+    data = _get(f"{GOPLUS_API}/api/v1/token_security/{gid}",
+                params={"contract_addresses": address})
+    if not data or str(data.get("code")) != "1":
+        return None
+    info = (data.get("result") or {}).get((address or "").lower()) or {}
+    if not info:
+        return None
+    cant_sell = str(info.get("cannot_sell_all", "0")) == "1"
+    is_hp = str(info.get("is_honeypot", "0")) == "1" or cant_sell
+    flags = [k for k in ("is_mintable", "is_proxy", "owner_can_change_balance",
+                         "is_blacklisted", "personal_sign", "selfdestruct")
+             if str(info.get(k, "0")) == "1"]
+    return {
+        "is_honeypot": is_hp,
+        "buy_tax": _goplus_pct(info.get("buy_tax")),
+        "sell_tax": _goplus_pct(info.get("sell_tax")),
+        "risk": "high" if (is_hp or flags) else "low",
+        "risk_level": 5 if (is_hp or flags) else 1,
+        "holders": _num(info.get("holder_count")),
+        "lp_locked": 0,
+        "danger_names": (["honeypot"] if is_hp else []) + flags,
+    }
+
+
 def _token_security_live(chain, address):
     """يفحص: هل البيع مستحيل؟ ما الضرائب؟ ما مستوى الخطر؟
-    EVM → honeypot.is | Solana → RugCheck"""
+    EVM → honeypot.is ثم GoPlus | Solana → RugCheck ثم GoPlus.
+    الفشل المزدوج فقط = مجهول (fail-closed محفوظ: الرفض الآمن يبقى)."""
     if chain == "solana":
-        return _solana_security(address)
+        return _solana_security(address) or _goplus_security(chain, address)
     chain_id = HONEYPOT_CHAIN_IDS.get(chain)
-    if not chain_id:
-        return None
-    data = _get(f"{HONEYPOT_API}/IsHoneypot",
-                params={"address": address, "chainID": chain_id})
-    if not data or "honeypotResult" not in data:
-        return None
-    hp = data.get("honeypotResult", {}) or {}
-    sim = data.get("simulationResult", {}) or {}
-    summary = data.get("summary", {}) or {}
-    return {
-        "is_honeypot": bool(hp.get("isHoneypot")),
-        "buy_tax": _num(sim.get("buyTax")),
-        "sell_tax": _num(sim.get("sellTax")),
-        "risk": str(summary.get("risk", "")),
-        "risk_level": _num(summary.get("riskLevel")),
-        "holders": _num((data.get("token") or {}).get("totalHolders")),
-        "lp_locked": 0,
-    }
+    if chain_id:
+        data = _get(f"{HONEYPOT_API}/IsHoneypot",
+                    params={"address": address, "chainID": chain_id})
+        if data and "honeypotResult" in data:
+            hp = data.get("honeypotResult", {}) or {}
+            sim = data.get("simulationResult", {}) or {}
+            summary = data.get("summary", {}) or {}
+            return {
+                "is_honeypot": bool(hp.get("isHoneypot")),
+                "buy_tax": _num(sim.get("buyTax")),
+                "sell_tax": _num(sim.get("sellTax")),
+                "risk": str(summary.get("risk", "")),
+                "risk_level": _num(summary.get("riskLevel")),
+                "holders": _num((data.get("token") or {}).get("totalHolders")),
+                "lp_locked": 0,
+            }
+    return _goplus_security(chain, address)
 
 
 def token_security(chain, address):
