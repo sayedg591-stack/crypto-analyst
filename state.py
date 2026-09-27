@@ -71,6 +71,37 @@ def gist_save(s):
         return False
 
 
+def gist_updated_at():
+    """يعيد updated_at للـGist (أو None عند الفشل) —
+    للتحقق الفعلي أن كتابتنا وصلت إلى الداشبورد."""
+    gid = os.environ.get("GIST_ID")
+    if not gid:
+        return None
+    try:
+        r = requests.get(f"{GIST_API}/{gid}",
+                         headers=_gist_headers() or {}, timeout=15)
+        if r.status_code != 200:
+            return None
+        return r.json().get("updated_at")
+    except Exception:
+        return None
+
+
+def verify_gist_changed(before, tries=4, gap=4):
+    """يتحقق أن الـGist تغيّر فعلاً بعد كتابتنا (مقارنة updated_at).
+    before=None تعني: أي قيمة غير فارغة = نجاح (أول كتابة).
+    الـVM هو الكاتب الوحيد، فأي تغيّر بعد كتابتنا هو كتابتنا."""
+    for _ in range(tries):
+        try:
+            cur = gist_updated_at()
+        except Exception:
+            cur = None
+        if cur and cur != before:
+            return True
+        time.sleep(gap)
+    return False
+
+
 def _defaults(s):
     s.setdefault("positions", {})
     s.setdefault("alerted", {})
@@ -80,6 +111,9 @@ def _defaults(s):
     s["strat_version"] = STRATEGY_VERSION
     s.setdefault("waitlist", {})
     s.setdefault("paper", _default_paper())
+    # طابور Telegram الدائم + حالة المزامنة (الثلاثة على خط واحد)
+    s.setdefault("tg_pending", [])
+    s.setdefault("sync", {})
     # أرشيف الصفقات المغلقة — يُملأ تدريجياً منذ هذا التحديث
     s["paper"].setdefault("closed_trades", [])
     # تعبئة مفاتيح حزمة الحماية للحالات القديمة (ترحيل صامت)
