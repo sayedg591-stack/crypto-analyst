@@ -1,1 +1,1 @@
-{"id": "readtrap3-20260928-1125", "cmd": "grep -c 'FREEZE' /home/ubuntu/bot/freeze-capture.log 2>&1; echo '===ALL-FREEZE-HEADERS==='; grep 'FREEZE' /home/ubuntu/bot/freeze-capture.log 2>&1; echo '===TAIL==='; tail -80 /home/ubuntu/bot/freeze-capture.log 2>&1", "timeout": 40, "note": "count freeze captures and show all headers plus tail"}
+{"id": "readtrap4-20260928-1130", "cmd": "awk '/FREEZE 2026-09-28T10:4[25]/,/---mem---/' /home/ubuntu/bot/freeze-capture.log 2>&1 | head -120", "timeout": 40, "note": "show 10:42 and 10:45 captures ps sections"}
