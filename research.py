@@ -54,6 +54,10 @@ TRACK_TTL_S = 25 * 3600      # نافذة التتبع: 25 ساعة ثم تُغ�
 TRACK_CAP = 150              # أقصى فرص مفتوحة تُتبع في كل جولة
 STALE_AFTER_S = 2 * 3600     # بلا ملاحظات لأكثر من ساعتين = stale
 TRACK_STAGGER_S = 90         # أقل فاصل بين ملاحظتين لنفس الفرصة
+# تتبع الرفضات (P1 — قياس Rejected Winners): طبقة مستقلة بفاصل أطول
+# وسقف مستقل حتى لا تزاحم الرفضاتُ الفرصَ المقيَّمة على ميزانية الـAPI.
+REJECT_TRACK_CAP = 60        # أقصى رفض مبكر يُتبع في الجولة
+REJECT_STAGGER_S = 1800      # 30 دقيقة بين ملاحظتين لنفس الرفض
 
 # أسباب الرفض المبكر (قبل التحليل) — تُسجَّل كلها، بلا استثناء
 REJECT_REASONS = (
@@ -310,8 +314,6 @@ class ResearchStore:
                 "SELECT first_seen_ts, n_seen FROM scan_opportunities "
                 "WHERE opportunity_id = ?", [oid]).fetchone()
             if exists:
-                # ظهور متكرر: نحدّث آخر مشاهدة والعداد والقيم اللحظية فقط —
-                # first_seen_ts والسعر المرجعي لا يتغيران أبداً.
                 con.execute(
                     """UPDATE scan_opportunities SET last_seen_ts = ?,
                        n_seen = n_seen + 1, price = ?, liquidity = ?,
@@ -329,8 +331,6 @@ class ResearchStore:
                 con.execute(
                     f"INSERT INTO scan_opportunities ({cols}) VALUES ({ph})",
                     list(row.values()))
-                # الملاحظة الصفرية: السعر المرجعي من بيانات الفحص نفسها —
-                # بلا أي طلب API إضافي.
                 self.record_observation(oid, now, 0.0, price,
                                         row["liquidity"], row["volume_m5"],
                                         source="scan")
@@ -344,8 +344,9 @@ class ResearchStore:
         """يسجل عملة رُفضت قبل التحليل (عتبات مبكرة/رمز/قائمة سوداء...).
         صف واحد لكل زوج: التكرار يحدّث n_seen/last_seen فقط.
         لا يمس قرار فرصة مقيَّمة سابقاً (التقييم أبقى من الرفض).
-        لا تُفتح لها ملاحظات سعرية ولا نتيجة — تسجيل فقط (قرار Phase 1:
-        ميزانية الـAPI للمقيَّمة). لا يرفع أبداً."""
+        P1: الرفضات تُتبع سعرياً بطبقة خفيفة (open_prefilter_rejects:
+        فاصل 30د وسقف مستقل) وتُغلق في finalize_due — لقياس
+        Rejected Winners دون مزاحمة الفرص المقيَّمة. لا يرفع أبداً."""
         try:
             con = self._connect()
             if con is None or not isinstance(p, dict):
@@ -359,7 +360,7 @@ class ResearchStore:
             oid = _opp_id(chain, pair_addr)
             now = time.time()
             base = p.get("baseToken") or {}
-            price = _f(p.get("priceUsd"))  # قد يكون NULL — صدق البيانات
+            price = _f(p.get("priceUsd"))
             liq = _f((p.get("liquidity") or {}).get("usd"))
             vol24 = _f((p.get("volume") or {}).get("h24"))
             age_h = None
@@ -383,7 +384,6 @@ class ResearchStore:
                            WHERE opportunity_id = ?""",
                         [now, price, liq, vol24, age_h, reason, reason, oid])
                 else:
-                    # مقيَّمة سابقاً: نحدّث المشاهدة فقط — القرار يبقى.
                     con.execute(
                         """UPDATE scan_opportunities SET last_seen_ts = ?,
                            n_seen = n_seen + 1
@@ -457,9 +457,11 @@ class ResearchStore:
             return False
 
     def open_opportunities(self, limit=TRACK_CAP):
-        """الفرص المفتوحة للتتبع — جدولة عادلة: الأقدم بلا ملاحظة أولاً
-        (لا تجويع للقديمة عند تجاوز السقف)، مع فاصل TRACK_STAGGER_S بين
-        الملاحظات لتوزيع حمل الـAPI. تُستبعد رفضات الـprefilter."""
+        """الفرص المقيَّمة المفتوحة للتتبع — جدولة عادلة: الأقدم بلا ملاحظة
+        أولاً (لا تجويع للقديمة عند تجاوز السقف)، مع فاصل TRACK_STAGGER_S
+        بين الملاحظات لتوزيع حمل الـAPI.
+        رفضات الـprefilter تُستبعد هنا — لها open_prefilter_rejects
+        (طبقة P1 بفاصل أطول وسقف مستقل)."""
         try:
             con = self._connect()
             if con is None:
@@ -488,6 +490,41 @@ class ResearchStore:
                      "pair": r[2], "first_seen_ts": r[3]} for r in rows]
         except Exception as e:
             print(f"[research] open_opportunities skipped: {e}")
+            return []
+
+    def open_prefilter_rejects(self, limit=REJECT_TRACK_CAP):
+        """رفضات الـprefilter المستحقة للتتبع الخفيف — وقود قياس
+        Rejected Winners في P1: هل العملات المرفوضة مبكراً انفجرت لاحقاً؟
+        نفس منطق الاستحقاق لكن بفاصل REJECT_STAGGER_S (30د) وسقف مستقل
+        REJECT_TRACK_CAP، حتى لا تزاحم الفرص المقيَّمة. لا ترفع أبداً."""
+        try:
+            con = self._connect()
+            if con is None:
+                return []
+            now = time.time()
+            cutoff = now - TRACK_TTL_S
+            due = now - REJECT_STAGGER_S
+            rows = con.execute(
+                """SELECT o.opportunity_id, o.chain, o.pair_address,
+                          o.first_seen_ts, MAX(po.ts) AS last_obs
+                   FROM scan_opportunities o
+                   LEFT JOIN opportunity_outcomes oc
+                     ON o.opportunity_id = oc.opportunity_id
+                   LEFT JOIN price_observations po
+                     ON o.opportunity_id = po.opportunity_id
+                   WHERE o.first_seen_ts >= ?
+                     AND o.signal = 'PREFILTER'
+                     AND (oc.status IS NULL OR oc.status = 'tracking')
+                   GROUP BY o.opportunity_id, o.chain, o.pair_address,
+                            o.first_seen_ts
+                   HAVING MAX(po.ts) IS NULL OR MAX(po.ts) < ?
+                   ORDER BY last_obs ASC NULLS FIRST
+                   LIMIT ?""",
+                [cutoff, due, int(limit)]).fetchall()
+            return [{"opportunity_id": r[0], "chain": r[1],
+                     "pair": r[2], "first_seen_ts": r[3]} for r in rows]
+        except Exception as e:
+            print(f"[research] open_prefilter_rejects skipped: {e}")
             return []
 
     def observations(self, opportunity_id):
@@ -602,7 +639,9 @@ class ResearchStore:
 
     def finalize_due(self):
         """إغلاق الفرص التي تجاوزت نافذة 25h — حساب نهائي من الملاحظات
-        الموجودة حتى لو لم تصل ملاحظة عند 24h بالضبط. لا يرفع أبداً."""
+        الموجودة حتى لو لم تصل ملاحظة عند 24h بالضبط.
+        يشمل رفضات الـprefilter (P1): إغلاقها ينتج مجموعة Rejected Winners
+        (mfe_pct / hit_100..900 للعملات المرفوضة). لا يرفع أبداً."""
         try:
             con = self._connect()
             if con is None:
@@ -613,7 +652,6 @@ class ResearchStore:
                    LEFT JOIN opportunity_outcomes oc
                      ON o.opportunity_id = oc.opportunity_id
                    WHERE o.first_seen_ts < ?
-                     AND o.signal != 'PREFILTER'
                      AND (oc.status IS NULL OR oc.status = 'tracking')""",
                 [cutoff]).fetchall()
             n = 0
@@ -738,9 +776,12 @@ def run_collection(results, price_fetcher=None):
 
 
 def _track_open(rs, price_fetcher=None):
-    """يجلب أسعار الفرص المفتوحة ويسجل ملاحظات. لا يرفع أبداً."""
+    """يجلب أسعار الفرص المفتوحة ويسجل ملاحظات. طبقتان:
+    المقيَّمة أولاً (فاصل 90ث) ثم رفضات الـprefilter (فاصل 30د، سقف
+    مستقل — لا تزاحم المقيَّمة). لا يرفع أبداً."""
     try:
         opps = rs.open_opportunities()
+        opps = opps + rs.open_prefilter_rejects()
         if not opps:
             return 0
         if price_fetcher is None:
