@@ -493,6 +493,15 @@ def below_threshold(verdict):
         return True  # رقم غير صالح = لا دخول (افتراض آمن)
 
 
+def _note_prefilter_reject(p, reason):
+    """توثيق الرفض المبكر لطبقة البحث — fail-safe تماماً، لا يغيّر أي قرار."""
+    try:
+        import research
+        research.note_prefilter_reject(p, reason)
+    except Exception:
+        pass
+
+
 def scan_new_coins(s, dry_run, ctx):
     print("=== فحص العملات الجديدة ===")
     # الاكتشاف: 4 مصادر مستقلة → متوازية (كانت متسلسلة)
@@ -522,17 +531,24 @@ def scan_new_coins(s, dry_run, ctx):
         ntx = float(tx.get("buys") or 0) + float(tx.get("sells") or 0)
         created = p.get("pairCreatedAt") or 0
         age_d = (now_ms - created) / 86400000 if created else 0
-        if liq < MIN_LIQUIDITY_USD or vol < MIN_VOLUME_24H_USD:
+        if liq < MIN_LIQUIDITY_USD:
+            _note_prefilter_reject(p, "REJECTED_LIQUIDITY")
+            continue
+        if vol < MIN_VOLUME_24H_USD:
+            _note_prefilter_reject(p, "REJECTED_VOLUME")
             continue
         if ntx < MIN_TXNS_24H:   # تنقية: عملات بلا نشاط حقيقي = ضجيج
+            _note_prefilter_reject(p, "REJECTED_TXNS")
             continue
         if created and age_d * 24 > NEW_ALERT_MAX_AGE_H:
+            _note_prefilter_reject(p, "REJECTED_AGE")
             continue  # الفرص الحقيقية في الساعات الأولى فقط
         # فلتر الرمز المشبوه (حروف خفية / تقليد عملات مشهورة)
         sym = ((p.get("baseToken") or {}).get("symbol") or "")
         ok, why = analyzer.check_symbol(sym)
         if not ok:
             print(f"  x رمز مرفوض {sym[:20]!r}: {why}")
+            _note_prefilter_reject(p, "REJECTED_SYMBOL")
             continue
         cands.append(p)
     cands.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
@@ -564,6 +580,7 @@ def scan_new_coins(s, dry_run, ctx):
             addr = (p.get("baseToken") or {}).get("address")
             # فحص السلامة: زوج بلا سعر = بيانات ناقصة — يُتجاهل (لا قرارات على فراغ)
             if not analyzer._f(p.get("priceUsd")):
+                _note_prefilter_reject(p, "REJECTED_NO_PRICE")
                 continue
             boosted = (chain, (addr or "").lower()) in boosted_set
             # الافتراض الآمن: فشل فحص الأمان لعملة بعنوان معروف = مرفوضة
@@ -585,6 +602,10 @@ def scan_new_coins(s, dry_run, ctx):
             results.append(res)
         except Exception as _e:
             print(f"  ⚠️ عملة متخطاة (خطأ غير متوقع): {_e}")
+            try:
+                _note_prefilter_reject(p, "REJECTED_ERROR")
+            except Exception:
+                pass
             continue
 
     results.sort(key=lambda r: r["score"], reverse=True)
@@ -599,6 +620,7 @@ def scan_new_coins(s, dry_run, ctx):
                                       chain=res.get("chain"))
             if bad:
                 print(f"  -> ⛔ محظورة (قائمة سوداء): {res['display']} — {why}")
+                _note_prefilter_reject(res.get("_pair") or {}, "REJECTED_BLACKLIST")
                 continue
             verdict = make_verdict(res, ctx)
             # طبقة البحث (Phase 1): توثيق الاحتمال المحسوب فقط — لا يغيّر شيئاً
@@ -651,6 +673,7 @@ def check_waitlist(s, dry_run, ctx):
     for wid in list(wl)[:25]:  # حد أقصى 25 إعادة فحص في الجولة (استنزاف API)
         e = wl[wid]
         if now - e["added"] > WAITLIST_MAX_AGE_H * 3600:
+
             wl.pop(wid, None)
             continue
         _todo.append((wid, e))
@@ -679,10 +702,13 @@ def check_waitlist(s, dry_run, ctx):
             continue
         created = p.get("pairCreatedAt") or 0
         if created and (now * 1000 - created) / 3_600_000 > NEW_ALERT_MAX_AGE_H:
+
             wl.pop(wid, None)  # تجاوزت نافذة الفرص المبكرة
             continue
         # فحص السلامة: زوج بلا سعر = بيانات ناقصة — يُتجاهل
         if not analyzer._f(p.get("priceUsd")):
+            _note_prefilter_reject(p, "REJECTED_NO_PRICE")
+
             wl.pop(wid, None)
             continue
         # الافتراض الآمن: فشل فحص الأمان = مرفوضة
@@ -696,6 +722,15 @@ def check_waitlist(s, dry_run, ctx):
         res["chain"] = e["chain"]
         res["pair"] = e["pair"]
         res["mint"] = addr
+        # توثيق إعادة التقييم لطبقة البحث (لقطة فحص + تحديث n_seen) —
+        # قراءة فقط، لا تغيّر أي قرار
+        res["_pair"] = p
+        res["_sec"] = sec
+        try:
+            import research
+            research.note_reevaluation(res)
+        except Exception:
+            pass
         if res["signal"] in ("BUY", "STRONG_BUY"):
             bad, why = is_blacklisted(s, mint=addr, chain=e["chain"])
             if bad:
@@ -718,8 +753,10 @@ def check_waitlist(s, dry_run, ctx):
             alerts.send(msg, dry_run)
             s["alerted"][f"sig:{wid}"] = now
             s["stats"]["signals_today"] = s["stats"].get("signals_today", 0) + 1
+
             wl.pop(wid, None)
         elif res["signal"] == "AVOID":
+
             wl.pop(wid, None)  # ساءت — أخرجها من اللائحة
         else:
             e["checks"] += 1
