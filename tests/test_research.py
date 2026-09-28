@@ -341,6 +341,132 @@ def test_note_prefilter_reject_buffer_drain():
         rs.close()
 
 
+def test_prefilter_rejects_tracked_lightly():
+    """P1: الرفضات تُتبع سعرياً بطبقة خفيفة — أول ملاحظة + نتيجة tracking،
+    ولا تظهر في قائمة المقيَّمة."""
+    rs, path = _store()
+    oid = rs.record_prefilter_reject(_make_pair("REJTRACK"), "REJECTED_LIQUIDITY")
+    assert oid == "solana:rejtrack", oid
+    calls = {"n": 0}
+
+    def fake(o):
+        calls["n"] += 1
+        return {"priceUsd": "0.0021",
+                "liquidity": {"usd": 5200}, "volume": {"m5": 60}}
+
+    n = research._track_open(rs, price_fetcher=fake)
+    assert n == 1, n
+    assert calls["n"] == 1, calls
+    obs = rs._connect().execute(
+        "SELECT price_usd, source FROM price_observations "
+        "WHERE opportunity_id = ?", [oid]).fetchall()
+    assert len(obs) == 1 and obs[0][1] == "track", obs
+    status = rs._connect().execute(
+        "SELECT status FROM opportunity_outcomes "
+        "WHERE opportunity_id = ?", [oid]).fetchone()[0]
+    assert status == "tracking", status
+    # المقيَّمة لا ترى الرفضات
+    assert rs.open_opportunities() == []
+    rs.close()
+
+
+def test_reject_tracking_stagger():
+    """P1: فاصل 30د بين ملاحظات الرفض — لا إغراق للـAPI."""
+    rs, path = _store()
+    rs.record_prefilter_reject(_make_pair("REJSTAG"), "REJECTED_AGE")
+    calls = {"n": 0}
+
+    def fake(o):
+        calls["n"] += 1
+        return {"priceUsd": "0.002"}
+
+    research._track_open(rs, price_fetcher=fake)
+    assert calls["n"] == 1
+    research._track_open(rs, price_fetcher=fake)
+    assert calls["n"] == 1, calls  # الفاصل لم يمر — لا تتبع ثانٍ
+    rs._connect().execute("UPDATE price_observations SET ts = ts - 2000")
+    research._track_open(rs, price_fetcher=fake)
+    assert calls["n"] == 2, calls  # بعد 30د+ يُستحق التتبع
+    rs.close()
+
+
+def test_reject_tracking_cap():
+    """P1: سقف مستقل 60 لرفضات الجولة — لا تزاحم المقيَّمة."""
+    rs, path = _store()
+    for i in range(70):
+        rs.record_prefilter_reject(_make_pair(f"REJCAP{i:02d}"),
+                                   "REJECTED_LIQUIDITY")
+    got = rs.open_prefilter_rejects()
+    assert len(got) == research.REJECT_TRACK_CAP == 60, len(got)
+    # المقيَّمة ما زالت بسقفها الخاص
+    assert len(rs.open_opportunities()) == 0
+    rs.close()
+
+
+def test_finalize_due_closes_rejects():
+    """P1: finalize_due يغلق الرفضات القديمة — وقود Rejected Winners."""
+    rs, path = _store()
+    oid = rs.record_prefilter_reject(_make_pair("REJOLD"), "REJECTED_VOLUME")
+    now = time.time()
+    con = rs._connect()
+    con.execute("UPDATE scan_opportunities SET first_seen_ts = ? "
+                "WHERE opportunity_id = ?", [now - 26 * 3600, oid])
+    rs.record_observation(oid, now - 20 * 3600, 20 * 3600, 0.0022)
+    n = rs.finalize_due()
+    assert n == 1, n
+    row = con.execute(
+        "SELECT status, ref_price FROM opportunity_outcomes "
+        "WHERE opportunity_id = ?", [oid]).fetchone()
+    assert row[0] in ("complete", "stale"), row
+    # السعر المرجعي = سعر لحظة الرفض (من عمود price) — لا سعر لاحق
+    assert abs(row[1] - 0.002) < 1e-9, row
+    rs.close()
+
+
+def test_rejected_winner_measurement():
+    """P1: القياس الذهبي — عملة مرفوضة تضاعفت: mfe≈+100% وhit_100=1."""
+    rs, path = _store()
+    oid = rs.record_prefilter_reject(_make_pair("REJWIN", price="0.002"),
+                                     "REJECTED_LIQUIDITY")
+
+    def fake(o):
+        return {"priceUsd": "0.004"}  # تضاعفت بعد الرفض
+
+    research._track_open(rs, price_fetcher=fake)
+    research._track_open(rs, price_fetcher=fake)  # محجوب بالفاصل
+    now = time.time()
+    con = rs._connect()
+    con.execute("UPDATE scan_opportunities SET first_seen_ts = ? "
+                "WHERE opportunity_id = ?", [now - 26 * 3600, oid])
+    # ملاحظة ثانية تُكمل الصورة قبل الإغلاق
+    rs.record_observation(oid, now - 3600, 25 * 3600, 0.004)
+    n = rs.finalize_due()
+    assert n == 1, n
+    row = con.execute(
+        "SELECT status, mfe_pct, hit_100, hit_300 FROM opportunity_outcomes "
+        "WHERE opportunity_id = ?", [oid]).fetchone()
+    assert row[0] == "complete", row
+    assert abs(row[1] - 100.0) < 0.01, row  # MFE +100%
+    assert row[2] == 1 and row[3] == 0, row  # أصابت +100% لا +300%
+    rs.close()
+
+
+def test_reject_promotion_to_evaluated():
+    """P1: رفض ترقّى لاحقاً إلى BUY — يغادر طبقة الرفضات ويلتحق بالمقيَّمة."""
+    rs, path = _store()
+    rs.record_prefilter_reject(_make_pair("PROMO"), "REJECTED_LIQUIDITY")
+    assert len(rs.open_prefilter_rejects()) == 1
+    rs.record_opportunity(_make_res(signal="BUY", score=75, addr="PROMO"))
+    sig = rs._connect().execute(
+        "SELECT signal, decision FROM scan_opportunities "
+        "WHERE opportunity_id = 'solana:promo'").fetchone()
+    assert sig == ("BUY", "BUY"), sig
+    assert rs.open_prefilter_rejects() == []  # غادر طبقة الرفضات
+    ids = [o["opportunity_id"] for o in rs.open_opportunities()]
+    assert "solana:promo" in ids, ids  # التحق بالمقيَّمة
+    rs.close()
+
+
 if __name__ == "__main__":
     test_schema_and_record()
     test_dedup_keeps_first_seen()
@@ -357,4 +483,10 @@ if __name__ == "__main__":
     test_track_cap_still_bounded()
     test_finalize_due()
     test_note_prefilter_reject_buffer_drain()
+    test_prefilter_rejects_tracked_lightly()
+    test_reject_tracking_stagger()
+    test_reject_tracking_cap()
+    test_finalize_due_closes_rejects()
+    test_rejected_winner_measurement()
+    test_reject_promotion_to_evaluated()
     print("كل اختبارات research نجحت ✓")
