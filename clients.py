@@ -964,8 +964,18 @@ class NewsClient:
                         return (name, [], False)
                     # حد أقصى 2MB قبل التحليل: خلاصات RSS الحقيقية أصغر
                     # بكثير — أي شيء أكبر = تضخيم كيانات XML خبيث
-                    # (billion laughs) أو تلف
-                    raw = r.raw.read(2_000_000)
+                    # (billion laughs) أو تلف.
+                    # ملاحظة: iter_content (وليس r.raw.read) لأن الخوادم
+                    # قد ترسل Brotli/gzip — r.raw يعيد البايتات مضغوطة
+                    # فيكسر التحليل، بينما iter_content يفك الضغط تلقائياً
+                    # والحد يُطبَّق على الحجم بعد فك الضغط (حماية من
+                    # قنابل فك الضغط أيضاً).
+                    buf = bytearray()
+                    for chunk in r.iter_content(chunk_size=65536):
+                        buf += chunk
+                        if len(buf) >= 2_000_000:
+                            break
+                    raw = bytes(buf[:2_000_000])
                 root = ET.fromstring(raw)
                 got = (self._parse_rss(root, name, tier)
                        + self._parse_atom(root, name, tier))
