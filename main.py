@@ -563,12 +563,14 @@ def scan_new_coins(s, dry_run, ctx):
             s["alerted"][key] = time.time()
             sent += 1
             s["stats"]["signals_today"] = s["stats"].get("signals_today", 0) + 1
-        elif res["signal"] == "AVOID" and any("⛔" in w for w in res["warnings"]):
-            # بأمر المستخدم (2026-09-28): مسار الرفض صامت تماماً — لا Telegram
-            # ولا سجل داشبورد (يثقل الداشبورد بلا فائدة). الرفض نفسه
-            # (fail-closed) لم يتغير، والتفاصيل تبقى في سجلات السيرفر.
-            print(f"  -> تحذير نصب (صامت): {res['display']}")
+        elif res["signal"] == "AVOID" and any("⛔" in w for w in res["warnings"]) \
+                and sent < 6:
+            # بأمر المستخدم (2026-09-28): تنبيهات الرفض تصل Telegram فقط —
+            # بلا تسجيل في سجل الداشبورد (يثقله بلا فائدة).
+            print(f"  -> تحذير نصب: {res['display']}")
+            alerts.send(alerts.avoid_msg(res), dry_run, log_alert=False)
             s["alerted"][key] = time.time()
+            sent += 1
         elif res["signal"] == "WATCH" and wait_added < WAITLIST_ADD_PER_RUN:
             # لائحة الانتظار: "شبه جاهزة" — تُعاد فحصها كل جولة لمدة 6 ساعات
             wl = s.setdefault("waitlist", {})

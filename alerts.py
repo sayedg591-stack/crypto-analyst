@@ -316,9 +316,7 @@ def new_signal_msg(res, verdict):
 
 
 def avoid_msg(res):
-    """تحذير بسيط: لا تدخل.
-    ملاحظة: غير مستدعاة حالياً — مسار الرفض صامت بأمر المستخدم (2026-09-28).
-    تُبقى هنا لإعادة التفعيل بسطر واحد إن طلب ذلك."""
+    """تحذير بسيط: لا تدخل."""
     name = html.escape(res["display"])
     reason = ""
     for w in (res.get("warnings") or []):
