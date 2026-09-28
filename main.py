@@ -263,7 +263,7 @@ def build_context(s):
     # يعمل فقط عند وجود الأسرار، وإلا يُتجاهل بصمت تام
     if USE_XBRIDGE:
         try:
-            import xbridge
+            import tracebackbridge
             xb = xbridge.fetch_xbridge_news(max_age_h=XBRIDGE_MAX_AGE_H)
             if xb:
                 ctx["news"] = (ctx.get("news") or []) + xb
@@ -1535,7 +1535,14 @@ def main():
         traceback.print_exc()
         print(f"[!] انهيار غير متوقع: {e}")
         if not a.dry_run:
-            _sos_alert(e)
+            # SOS alert gets max 30s — never hang the process on Telegram API
+            signal.alarm(30)
+            try:
+                _sos_alert(e)
+            except Exception as sos_e:
+                print(f"[!] SOS failed: {sos_e}")
+            finally:
+                signal.alarm(0)
         raise  # يفشل الـworkflow بعلامة حمراء — وضوح كامل
     finally:
         signal.alarm(0)
