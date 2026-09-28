@@ -1,6 +1,6 @@
 {
-  "id": "burnrot-verify-20260926",
-  "cmd": "git -C /home/ubuntu/bot/crypto-analyst rev-parse --short HEAD; grep -E '^SOURCE_COOLDOWN_BASE' /home/ubuntu/bot/crypto-analyst/config.py; grep -c '_get.last_status' /home/ubuntu/bot/crypto-analyst/clients.py; grep -A2 'status_code == 429' /home/ubuntu/bot/crypto-analyst/clients.py | head -4",
+  "id": "freezelogs-20260928-0820",
+  "cmd": "cd /home/ubuntu/bot && echo '==MON-TAIL6==' && tail -6 monitor.log && echo '==SCAN-TAIL6==' && tail -6 scan.log && echo '==FLOW-TAIL4==' && tail -4 flow.log && echo '==HEAVY-TAIL4==' && tail -4 heavy.log && echo '==WC==' && wc -l monitor.log scan.log",
   "timeout": 60,
-  "note": "verify burn-rotate deploy live on VM"
+  "note": "recon: log formats and tails after 07:24 freeze"
 }
