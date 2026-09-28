@@ -578,6 +578,10 @@ def scan_new_coins(s, dry_run, ctx):
             res["chain"] = chain
             res["pair"] = p.get("pairAddress")
             res["mint"] = addr
+            # طبقة البحث (Phase 1): إرفاق البيانات الخام للتوثيق فقط —
+            # لا تغيّر أي قرار (تُقرأ لاحقاً من research.run_collection)
+            res["_pair"] = p
+            res["_sec"] = sec
             results.append(res)
         except Exception as _e:
             print(f"  ⚠️ عملة متخطاة (خطأ غير متوقع): {_e}")
@@ -597,6 +601,9 @@ def scan_new_coins(s, dry_run, ctx):
                 print(f"  -> ⛔ محظورة (قائمة سوداء): {res['display']} — {why}")
                 continue
             verdict = make_verdict(res, ctx)
+            # طبقة البحث (Phase 1): توثيق الاحتمال المحسوب فقط — لا يغيّر شيئاً
+            res["_verdict_prob"] = verdict.get("prob")
+            res["_verdict_sent"] = verdict.get("news_sent")
             print(f"  -> إشارة {res['signal']}: {res['display']} "
                   f"({res['score']}) نجاح~{verdict['prob']}%")
             # عتبة الثقة: نسبة ضعيفة = مراقبة فقط (لا دخول ولا تنبيه)
@@ -1389,6 +1396,9 @@ def scan_watchlist(s, dry_run, ctx):
                 print(f"  -> ⛔ محظورة (قائمة سوداء): {res['display']} — {why}")
                 continue
             verdict = make_verdict(res, ctx)
+            # طبقة البحث (Phase 1): توثيق الاحتمال المحسوب فقط — لا يغيّر شيئاً
+            res["_verdict_prob"] = verdict.get("prob")
+            res["_verdict_sent"] = verdict.get("news_sent")
             print(f"  -> إشارة {res['signal']}: {res['display']} "
                   f"({res['score']}) نجاح~{verdict['prob']}%")
             # بوابة الثقة (نفسها في كل المسارات): احتمال < 50% = مراقبة فقط
@@ -1609,6 +1619,13 @@ def _scan(a):
     # (قراءة فقط: تُسجَّل بعد التقييم، ولا تغيّر أي قرار)
     if market_store is not None:
         _snapshot_results(results)
+    # طبقة جمع بيانات البحث (Phase 1): تسجيل كل فرصة + تتبع أسعارها —
+    # قراءة فقط، لا تغيّر أي قرار ولا أي عتبة في v2 (fail-safe بالكامل)
+    try:
+        import research
+        research.run_collection(results)
+    except Exception as e:
+        print("research skipped:", e)
     check_waitlist(s, a.dry_run, ctx)
     update_positions(s, a.dry_run)
     movers = scan_watchlist(s, a.dry_run, ctx)
