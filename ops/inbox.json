@@ -1,6 +1,6 @@
 {
-  "id": "croncheck-20260928-0915",
-  "cmd": "echo '==CRON-PROC==' && pgrep -a cron | head -5; echo '==CRONTAB==' && crontab -l 2>&1 | head -20; echo '==TRAP-FILE==' && ls -lh /home/ubuntu/bot/freeze-watch.sh 2>&1; echo '==TRAP-CONTENT-CHECK==' && grep -c 'gt 6' /home/ubuntu/bot/freeze-watch.sh 2>&1",
+  "id": "timers-20260928-0920",
+  "cmd": "echo '==TIMERS==' && systemctl list-timers --all --no-pager 2>&1 | head -25; echo '==DATE==' && date -u +%FT%TZ && date +%FT%TZ",
   "timeout": 30,
-  "note": "check cron daemon and trap installation"
+  "note": "list systemd timers and check timezone"
 }
