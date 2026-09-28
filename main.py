@@ -18,6 +18,7 @@ import alerts
 import expert
 import state as st
 from statelock import state_locked
+    
 from config import (CHAINS, SCAN_LIMIT, MIN_LIQUIDITY_USD, MIN_VOLUME_24H_USD,
     MIN_TXNS_24H, MAX_PAIR_AGE_DAYS, WATCHLIST, TAKE_PROFITS, STOP_LOSS,
     TRAIL_PCT, MOMENTUM_CUTOFF_H, MOMENTUM_MIN_GAIN,
@@ -1530,8 +1531,8 @@ def main():
 
     # حد دفاعي 120 ثانية ضد التجمّد: يُجهَض الفحص المعلّق ويُحرَّر القفل
     # تلقائياً — الفحص التالي (بعد دقيقة) يبدأ نظيفاً بدل 30 دقيقة توقف.
-    signal.signal(signal.SIGALRM, _scan_timeout_handler)
-    
+    signal.alarm(120)
+
     try:
         _run(a)
     except ScanTimeout:
