@@ -184,31 +184,80 @@ def is_blacklisted(s, mint=None, symbol=None, chain=None):
 
 
 def build_context(s):
-    """سياق الخبير: الأخبار الموثوقة + العملات الرائجة + نبض مُتحقق + ذاكرة النتائج."""
+    """سياق الخبير: الأخبار الموثوقة + العملات الرائجة + نبض مُتحقق + ذاكرة النتائج.
+    الكتل الخمس مستقلة تماماً → تُنفَّذ متوازية (كانت متسلسلة)."""
     ctx = {"news": [], "trending": [], "macro": None, "nc": None,
            "fng": None, "news_stats": {}}
-    if USE_NEWS:
+
+    def _news_block():
+        if not USE_NEWS:
+            return None
         try:
             nc = clients.NewsClient()
-            ctx["news"] = nc.fetch()
-            ctx["nc"] = nc
-            ctx["news_stats"] = nc.stats
-            print(f"أخبار: {len(ctx['news'])} عنواناً من "
-                  f"{nc.stats['sources_ok']} مصادر موثوقة "
-                  f"(مكرر مُزال: {nc.stats['dupes_merged']})")
+            items = nc.fetch()
             # معنويات محلية (نموذج ONNX على الجهاز — بلا حصة API):
             # تُعيد تقييم معنويات العناوين؛ عند غياب النموذج يبقى
             # التقييم الحالي لأن البديل مطابق له حرفياً (نفس الكلمات)
             if nlp_scorer is not None:
                 try:
-                    for _it in (ctx["news"] or []):
+                    for _it in (items or []):
                         _it["sentiment"] = nlp_scorer.score(
                             _it.get("title"))
-                    print(f"  -> معنويات محلية [{nlp_scorer.backend()}]")
                 except Exception as _e:
                     print("nlp rescore skipped:", _e)
+            return (items, nc, dict(nc.stats))
         except Exception as e:
             print("news error:", e)
+            return None
+
+    def _trend_block():
+        if not USE_COINGECKO:
+            return None
+        try:
+            # سلسلة احتياطية: CoinGecko → CoinPaprika (تلقائي)
+            tr, tr_src = clients.trending_chain(s)
+            return (tr or [], tr_src)
+        except Exception:
+            return None
+
+    def _macro_block():
+        if not USE_COINGECKO:
+            return None
+        try:
+            return clients.verified_macro()
+        except Exception:
+            return None
+
+    def _fng_block():
+        if not USE_FNG:
+            return None
+        try:
+            return clients.fear_greed()
+        except Exception:
+            return None
+
+    def _reddit_block():
+        # ضجة Reddit العضوية (ذكرات $TICKER — مصدر ناعم بحد أقصى)
+        try:
+            return clients.reddit_mentions()
+        except Exception:
+            return None
+
+    _nr, _tr, _mc, _fg, _rd = clients.pmap(
+        lambda f: f(),
+        [_news_block, _trend_block, _macro_block, _fng_block, _reddit_block],
+        max_workers=5)
+
+    if _nr:
+        items, nc, stats = _nr
+        ctx["news"] = items
+        ctx["nc"] = nc
+        ctx["news_stats"] = stats
+        print(f"أخبار: {len(items)} عنواناً من "
+              f"{stats['sources_ok']} مصادر موثوقة "
+              f"(مكرر مُزال: {stats['dupes_merged']})")
+        if nlp_scorer is not None:
+            print(f"  -> معنويات محلية [{nlp_scorer.backend()}]")
     # جسر أخبار X عبر قنوات Telegram (Telethon) — تلميحات إضافية بأدنى ثقة
     # يعمل فقط عند وجود الأسرار، وإلا يُتجاهل بصمت تام
     if USE_XBRIDGE:
@@ -220,42 +269,26 @@ def build_context(s):
                 print(f"أخبار X⇄TG: {len(xb)} عنصراً من قنوات Telegram")
         except Exception as e:
             print("xbridge error:", e)
-    if USE_COINGECKO:
-        try:
-            # سلسلة احتياطية: CoinGecko → CoinPaprika (تلقائي)
-            tr, tr_src = clients.trending_chain(s)
-            ctx["trending"] = tr or []
-            if tr:
-                print(f"الرائجة الآن: {len(tr)} عملة [{tr_src}]")
-        except Exception:
-            pass
-        try:
-            ctx["macro"] = clients.verified_macro()
-            m = ctx["macro"]
-            if m and m.get("btc_chg") is not None:
-                nsrc = m.get("macro_sources", 2)
-                v = "✓ مُتحقق" if m.get("verified") else "؟ غير مؤكد"
-                print(f"BTC: {m['btc_chg']:+.1f}% (24س) [{v} من {nsrc} مصادر]")
-        except Exception:
-            pass
-    if USE_FNG:
-        try:
-            ctx["fng"] = clients.fear_greed()
-            if ctx["fng"]:
-                print(f"الخوف والطمع: {ctx['fng']['value']}/100 "
-                      f"({ctx['fng']['label']})")
-        except Exception:
-            pass
-    # ضجة Reddit العضوية (ذكرات $TICKER — مصدر ناعم بحد أقصى)
-    try:
-        ctx["reddit"] = clients.reddit_mentions()
-        if ctx["reddit"]:
-            top = sorted(ctx["reddit"].items(), key=lambda kv: kv[1],
-                         reverse=True)[:3]
-            print(f"Reddit: {len(ctx['reddit'])} رمزاً مذكوراً "
-                  f"(أعلاها: {', '.join(f'${k}×{v}' for k, v in top)})")
-    except Exception:
-        pass
+    if _tr:
+        tr, tr_src = _tr
+        ctx["trending"] = tr
+        print(f"الرائجة الآن: {len(tr)} عملة [{tr_src}]")
+    if _mc:
+        ctx["macro"] = _mc
+        m = _mc
+        if m.get("btc_chg") is not None:
+            nsrc = m.get("macro_sources", 2)
+            v = "✓ مُتحقق" if m.get("verified") else "؟ غير مؤكد"
+            print(f"BTC: {m['btc_chg']:+.1f}% (24س) [{v} من {nsrc} مصادر]")
+    if _fg:
+        ctx["fng"] = _fg
+        print(f"الخوف والطمع: {_fg['value']}/100 ({_fg['label']})")
+    if _rd:
+        ctx["reddit"] = _rd
+        top = sorted(_rd.items(), key=lambda kv: kv[1],
+                     reverse=True)[:3]
+        print(f"Reddit: {len(_rd)} رمزاً مذكوراً "
+              f"(أعلاها: {', '.join(f'${k}×{v}' for k, v in top)})")
     ctx["band_stats"] = st.band_stats(s)
     # عدد الصفقات المغلقة — يحدد وزن نموذج المعايرة (0 = الأحكام وحدها)
     try:
@@ -462,10 +495,13 @@ def below_threshold(verdict):
 
 def scan_new_coins(s, dry_run, ctx):
     print("=== فحص العملات الجديدة ===")
-    profiles = clients.latest_profiles()
-    boosts = clients.latest_boosts()
-    tops = clients.top_boosts()
-    gecko = clients.geckoterminal_tokens()
+    # الاكتشاف: 4 مصادر مستقلة → متوازية (كانت متسلسلة)
+    _disc = clients.pmap(
+        lambda f: f() or [],
+        [clients.latest_profiles, clients.latest_boosts,
+         clients.top_boosts, clients.geckoterminal_tokens],
+        max_workers=4)
+    profiles, boosts, tops, gecko = _disc
     boosted_set = {(c, a.lower()) for c, a in boosts}
     tokens = profiles + boosts + tops + gecko
     seen, uniq = set(), []
@@ -504,8 +540,23 @@ def scan_new_coins(s, dry_run, ctx):
     cands = cands[:SCAN_LIMIT]
     print(f"مرشحون بعد التصفية: {len(cands)}")
 
+    # I/O متوازٍ: فحص الأمان + تركيز الحيتان لكل مرشح
+    # (كان متسلسلاً: حتى 40 عملة × طلبين). التحليل نفسه يبقى متسلسلاً.
+    def _sec_one(p):
+        chain = p.get("chainId")
+        addr = (p.get("baseToken") or {}).get("address")
+        sec, sec_err = clients.token_security(chain, addr) \
+            if addr else (None, None)
+        holders = (clients.solana_top10_pct(addr)
+                   if (chain == "solana" and addr) else None)
+        return (p, sec, sec_err, holders)
+
+    _fetched = clients.pmap(_sec_one, cands, max_workers=10)
     results = []
-    for p in cands:
+    for _r in _fetched:
+        if not _r:
+            continue
+        p, sec, sec_err, holders = _r
         # حارس «لا تتوقف أبداً»: عملة واحدة فاسدة/استثناء غير متوقع
         # يجب ألا يقتل الفحص كله — تُسجَّل ويُكمل للعملة التالية.
         try:
@@ -515,17 +566,13 @@ def scan_new_coins(s, dry_run, ctx):
             if not analyzer._f(p.get("priceUsd")):
                 continue
             boosted = (chain, (addr or "").lower()) in boosted_set
-            sec = clients.token_security(chain, addr) if addr else None
             # الافتراض الآمن: فشل فحص الأمان لعملة بعنوان معروف = مرفوضة
             sec_failed = bool(addr) and sec is None
-            # سبب الفشل الحقيقي (إن وُجد) — يظهر في السجل بدل التخمين
-            sec_err = getattr(clients, "LAST_SEC_ERROR", None) if sec_failed else None
             # 🐋 فحص تركيز الحيتان (Solana فقط — مجاني بلا مفتاح عبر RugCheck)
-            holders = (clients.solana_top10_pct(addr)
-                       if (chain == "solana" and addr) else None)
             res = analyzer.analyze_pair(p, sec, boosted=boosted, holders=holders,
                                         security_unknown=sec_failed,
-                                        security_error=sec_err)
+                                        security_error=sec_err
+                                        if sec_failed else None)
             res["id"] = f"dex:{chain}:{p.get('pairAddress')}"
             res["kind"] = "dex"
             res["chain"] = chain
@@ -592,12 +639,32 @@ def check_waitlist(s, dry_run, ctx):
         return
     print(f"=== إعادة فحص لائحة الانتظار ({len(wl)}) ===")
     now = time.time()
+    # تصفية محلية أولاً (بلا I/O): المنتهية تُحذف فوراً
+    _todo = []
     for wid in list(wl)[:25]:  # حد أقصى 25 إعادة فحص في الجولة (استنزاف API)
         e = wl[wid]
         if now - e["added"] > WAITLIST_MAX_AGE_H * 3600:
             wl.pop(wid, None)
             continue
+        _todo.append((wid, e))
+    # I/O متوازٍ: بيانات الزوج + فحص الأمان + الحيتان (كان متسلسلاً)
+    def _wl_one(item):
+        wid, e = item
         p, _wl_src = clients.pair_chain(s, e["chain"], e["pair"])
+        if not p:
+            return (wid, e, None, None, None, None)
+        addr = (p.get("baseToken") or {}).get("address")
+        sec, sec_err = clients.token_security(e["chain"], addr) \
+            if addr else (None, None)
+        holders = (clients.solana_top10_pct(addr)
+                   if (e["chain"] == "solana" and addr) else None)
+        return (wid, e, p, addr, (sec, sec_err), holders)
+
+    for _r in clients.pmap(_wl_one, _todo, max_workers=8):
+        if not _r:
+            continue
+        wid, e, p, addr, _secpair, holders = _r
+        sec, sec_err = _secpair or (None, None)
         if not p:
             e["checks"] += 1
             if e["checks"] >= 3:
@@ -607,21 +674,16 @@ def check_waitlist(s, dry_run, ctx):
         if created and (now * 1000 - created) / 3_600_000 > NEW_ALERT_MAX_AGE_H:
             wl.pop(wid, None)  # تجاوزت نافذة الفرص المبكرة
             continue
-        sec = clients.token_security(e["chain"],
-                                      (p.get("baseToken") or {}).get("address"))
-        addr = (p.get("baseToken") or {}).get("address")
         # فحص السلامة: زوج بلا سعر = بيانات ناقصة — يُتجاهل
         if not analyzer._f(p.get("priceUsd")):
             wl.pop(wid, None)
             continue
         # الافتراض الآمن: فشل فحص الأمان = مرفوضة
         sec_failed = bool(addr) and sec is None
-        sec_err = getattr(clients, "LAST_SEC_ERROR", None) if sec_failed else None
-        holders = (clients.solana_top10_pct(addr)
-                   if (e["chain"] == "solana" and addr) else None)
         res = analyzer.analyze_pair(p, sec, holders=holders,
                                     security_unknown=sec_failed,
-                                    security_error=sec_err)
+                                    security_error=sec_err
+                                    if sec_failed else None)
         res["id"] = wid
         res["kind"] = "dex"
         res["chain"] = e["chain"]
@@ -925,12 +987,19 @@ def _death_signals(pos, pair, now):
     return confirmed
 
 
-def _update_one_paper_position(s, p, pid, pos, closed, partials, dry_run):
-    """متابعة صفقة وهمية واحدة — تُستدعى داخل try/except لكل صفقة."""
+def _update_one_paper_position(s, p, pid, pos, closed, partials, dry_run,
+                               pre=None):
+    """متابعة صفقة وهمية واحدة — تُستدعى داخل try/except لكل صفقة.
+    pre: أسعار مسبقة الجلب {pid: (price, liq)} لتفادي طلبات متسلسلة."""
+    def _px():
+        if pre is not None and pid in pre:
+            return pre[pid]
+        return current_price(s, pos)
+
     # انتهاء مدة المتابعة (time-stop): يُفحص أولاً — حتى لو تعذّر جلب
     # السعر الحالي، الصفقة العتيقة تُغلق (بسعر الدخول) ولا تبقى عالقة للأبد
     if time.time() - pos["entry_time"] > POSITION_MAX_AGE_H * 3600:
-        price_now, _liq = current_price(s, pos)
+        price_now, _liq = _px()
         eff_price = (price_now * (1 - PAPER_SLIPPAGE)
                      if price_now else pos["entry"])
         pnl, _proceeds = _paper_close(p, pid, pos, eff_price, "EXPIRED",
@@ -944,7 +1013,7 @@ def _update_one_paper_position(s, p, pid, pos, closed, partials, dry_run):
             p["cash"]),
             dry_run)
         return
-    price, _liq = current_price(s, pos)
+    price, _liq = _px()
     if not price:
         return
     # لقطة سوقية للمخزن البحثي (مصدر "monitor") — قراءة فقط، بلا API
@@ -1091,11 +1160,19 @@ def update_paper(s, dry_run):
     closed = []
     partials = []
     arch_before = len(p.get("closed_trades", []))
-    for pid, pos in list(p["positions"].items()):
+    # I/O متوازٍ: أسعار الصفقات الوهمية مسبقاً (كانت متسلسلة داخل كل صفقة)
+    _items = list(p["positions"].items())
+    _pre = {}
+    for _r in clients.pmap(
+            lambda it: (it[0], current_price(s, it[1])),
+            _items, max_workers=6):
+        if _r:
+            _pre[_r[0]] = _r[1]
+    for pid, pos in _items:
         # صفقة واحدة فاسدة يجب ألا تُسقط متابعة البقية
         try:
             _update_one_paper_position(s, p, pid, pos, closed, partials,
-                                       dry_run)
+                                       dry_run, pre=_pre)
         except Exception as e:
             print(f"  -> خطأ في متابعة {pos.get('name')}: {e} — تُترك مفتوحة")
             continue
@@ -1168,8 +1245,15 @@ def current_price(s, pos):
 def update_positions(s, dry_run):
     print("=== متابعة الصفقات المفتوحة ===")
     closed = []
-    for pid, pos in list(s["positions"].items()):
-        price, liq = current_price(s, pos)
+    # I/O متوازٍ: أسعار الصفقات المفتوحة (كانت متسلسلة) — القرار يبقى متسلسلاً
+    _px = clients.pmap(
+        lambda it: (it[0], it[1], current_price(s, it[1])),
+        list(s["positions"].items()), max_workers=6)
+    for _r in _px:
+        if not _r:
+            continue
+        pid, pos, _pr = _r
+        price, liq = _pr or (None, None)
         if not price:
             continue
         entry = pos["entry"]
@@ -1256,8 +1340,16 @@ def update_positions(s, dry_run):
 def scan_watchlist(s, dry_run, ctx):
     print("=== فحص عملات Binance ===")
     movers = []
-    for sym in WATCHLIST:
+    # I/O متوازٍ: سعر + شموع كل رمز (كان متسلسلاً: 20 طلباً)
+    def _wl_sym(sym):
         t = clients.binance_ticker(sym)
+        k = clients.binance_klines(sym) if t else None
+        return (sym, t, k)
+
+    for _r in clients.pmap(_wl_sym, list(WATCHLIST), max_workers=10):
+        if not _r:
+            continue
+        sym, t, k = _r
         if not t:
             continue
         try:
@@ -1265,7 +1357,6 @@ def scan_watchlist(s, dry_run, ctx):
         except (TypeError, ValueError):
             continue
         movers.append((sym.replace("USDT", ""), chg))
-        k = clients.binance_klines(sym)
         # كشف الضخ المفاجئ: حجم آخر ساعة مقابل متوسط الساعات السابقة
         try:
             vols = [float(x[5]) for x in k[-(VOL_SPIKE_LOOKBACK + 1):-1]

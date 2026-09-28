@@ -93,7 +93,7 @@ def analyze_pair(pair, security=None, boosted=False, holders=None,
     """تقييم عملة جديدة من بيانات Dexscreener + فحص العقد.
     boosted: هل الفريق يروّج لها بترويج مدفوع على Dexscreener؟
     security_unknown: تعذّر فحص الأمان (API فشل) — الافتراض الآمن يرفضها فوراً.
-    security_error: سبب الفشل الحقيقي (من clients.LAST_SEC_ERROR) — يظهر في
+    security_error: سبب الفشل الحقيقي (من clients.token_security) — يظهر في
     السجل بدل "API لا يستجيب" الغامضة."""
     reasons, warnings = [], []
     score = 0

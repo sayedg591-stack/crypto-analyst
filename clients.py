@@ -5,6 +5,8 @@ import random
 import re
 import os
 import json
+import threading
+import concurrent.futures
 import requests
 from config import (
     DEXSCREENER_API, HONEYPOT_API, HONEYPOT_CHAIN_IDS, RUGCHECK_API,
@@ -36,7 +38,8 @@ def chain_try(s, key, candidates, need=None):
     الشفاء الذاتي: المصدر الذي يفشل SOURCE_FAILS_TO_COOL مرات متتالية
     يدخل تبريداً تلقائياً (يُتخطى حتى انتهاء التبريد، والتبريد يتضاعف
     عند التكرار حتى SOURCE_COOLDOWN_MAX) ثم يُعاد اختباره وحده."""
-    src = s.setdefault("sources", {}).setdefault(key, {})
+    with _IO_LOCK:  # تهيئة آمنة عند أول استدعاء متوازٍ
+        src = s.setdefault("sources", {}).setdefault(key, {})
     now = time.time()
     for name, fn in candidates:
         h = src.get(name) or {}
@@ -48,14 +51,15 @@ def chain_try(s, key, candidates, need=None):
         except Exception:
             ok, data = False, None
         if ok:
-            h.update({"fails": 0, "cool_until": 0, "last_ok": now,
-                      "uses": int(h.get("uses") or 0) + 1})
-            src[name] = h
-            for n2, h2 in src.items():  # مصدر واحد نشط فقط لكل سلسلة
-                h2["active"] = (n2 == name)
+            with _IO_LOCK:
+                h.update({"fails": 0, "cool_until": 0, "last_ok": now,
+                          "uses": int(h.get("uses") or 0) + 1})
+                src[name] = h
+                for n2, h2 in src.items():  # مصدر واحد نشط فقط لكل سلسلة
+                    h2["active"] = (n2 == name)
             return data, name
         fails = int(h.get("fails") or 0) + 1
-        if _get.last_status == 429:
+        if _last_status() == 429:
             # تدوير قاسي: الحصة انتهت/حُظر المصدر → تبريد فوري من أول ضربة،
             # والانتقال للبديل تمّ أصلاً (نحن هنا بعد فشل المرشح الحالي).
             fails = max(fails, SOURCE_FAILS_TO_COOL)
@@ -65,12 +69,48 @@ def chain_try(s, key, candidates, need=None):
             h["cool_until"] = now + cd
         h["fails"] = fails
         h["active"] = False
-        src[name] = h
+        with _IO_LOCK:
+            src[name] = h
     return None, None
 
 _session = requests.Session()
 _session.headers.update({"User-Agent": BROWSER_UA,
                          "Accept": "application/json"})
+
+
+# ---------- التوازي الآمن لمهام الـI/O ----------
+# _IO_LOCK: يحمي الكتابات المشتركة (كاش الأمان/الأزواج على القرص +
+# حالة المصادر s["sources"]) عند تنفيذ طلبات HTTP متوازية.
+# _tls: حالة كل خيط على حدة — كانت globals تتسابق بين الخيوط
+# (last_status, أعلام الحمولات) فأصبحت thread-local.
+_IO_LOCK = threading.RLock()
+_tls = threading.local()
+
+
+def _last_status():
+    """آخر رمز HTTP في الخيط الحالي (0 = خطأ شبكة)."""
+    return getattr(_tls, "last_status", 0)
+
+
+def pmap(fn, items, max_workers=8):
+    """تنفيذ متوازٍ لمهام I/O مع الحفاظ على ترتيب النتائج.
+    أي استثناء داخل مهمة = عنصر None (fail-soft: مهمة فاسدة
+    لا تُسقط الدفعة كلها). القائمة الفارغة تعيد [] فوراً."""
+    items = list(items)
+    if not items:
+        return []
+
+    def _safe(x):
+        try:
+            return fn(x)
+        except Exception:
+            return None
+
+    if len(items) == 1:
+        return [_safe(items[0])]
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers) as ex:
+        return list(ex.map(_safe, items))
 
 
 def _get(url, params=None, tries=None):
@@ -84,12 +124,14 @@ def _get(url, params=None, tries=None):
       الـfailover تُستخدم tries=1: المصدر البديل *هو* إعادة المحاولة —
       لا معنى لإضاعة 30 ثانية على مصدر ميت بينما البديل جاهز."""
     _get.last_status = 0
+    _tls.last_status = 0
     n = BACKOFF_TRIES if tries is None else max(1, int(tries))
     wait = BACKOFF_BASE
     for _ in range(n):
         try:
             r = _session.get(url, params=params, timeout=REQUEST_TIMEOUT)
             _get.last_status = r.status_code
+            _tls.last_status = r.status_code
             if r.status_code == 200:
                 try:
                     return r.json()
@@ -224,19 +266,28 @@ def stocktwits_sentiment(symbol):
 
 
 def pairs_for_tokens(tokens):
-    """يجلب أزواج التداول لعناوين العملات (حتى 30 عنواناً في الطلب الواحد)."""
+    """يجلب أزواج التداول لعناوين العملات (حتى 30 عنواناً في الطلب الواحد).
+    دفعات الشبكة تُنفَّذ متوازية (كانت متسلسلة) — الترتيب محفوظ."""
     by_chain = {}
     for chain, addr in tokens:
         by_chain.setdefault(chain, [])
         if addr not in by_chain[chain]:
             by_chain[chain].append(addr)
-    pairs = []
+    jobs = []
     for chain, addrs in by_chain.items():
         for i in range(0, len(addrs), 30):
-            chunk = ",".join(addrs[i:i + 30])
-            data = _get(f"{DEXSCREENER_API}/latest/dex/tokens/{chunk}")
-            if data and isinstance(data.get("pairs"), list):
-                pairs.extend(data["pairs"])
+            jobs.append((chain, ",".join(addrs[i:i + 30])))
+
+    def _one(job):
+        chain, chunk = job
+        data = _get(f"{DEXSCREENER_API}/latest/dex/tokens/{chunk}")
+        if data and isinstance(data.get("pairs"), list):
+            return data["pairs"]
+        return []
+
+    pairs = []
+    for part in pmap(_one, jobs, max_workers=8):
+        pairs.extend(part or [])
     return pairs
 
 
@@ -314,13 +365,14 @@ def _pair_cache_store(key, data):
     if not isinstance(data, dict):
         return
     try:
-        d = _pair_cache_load()
-        d[key] = {"v": data, "t": time.time()}
-        if len(d) > _PAIR_CACHE_MAX:
-            old = sorted(d.items(), key=lambda kv: kv[1].get("t", 0))
-            for k, _ in old[: len(d) - _PAIR_CACHE_MAX]:
-                d.pop(k, None)
-        _pair_cache_save(d)
+        with _IO_LOCK:  # قراءة-تعديل-كتابة ذرية بين الخيوط
+            d = _pair_cache_load()
+            d[key] = {"v": data, "t": time.time()}
+            if len(d) > _PAIR_CACHE_MAX:
+                old = sorted(d.items(), key=lambda kv: kv[1].get("t", 0))
+                for k, _ in old[: len(d) - _PAIR_CACHE_MAX]:
+                    d.pop(k, None)
+            _pair_cache_save(d)
     except Exception:
         pass
 
@@ -413,14 +465,15 @@ def _sec_store(key, section, value):
     if value is None:
         return
     try:
-        d = _sec_cache_load()
-        sec = d.setdefault(section, {})
-        sec[key] = {"v": value, "t": time.time()}
-        if len(sec) > _SEC_CACHE_MAX:  # حد أقصى ضد تضخم الملف
-            old = sorted(sec.items(), key=lambda kv: kv[1].get("t", 0))
-            for k, _ in old[: len(sec) - _SEC_CACHE_MAX]:
-                sec.pop(k, None)
-        _sec_cache_save(d)
+        with _IO_LOCK:  # قراءة-تعديل-كتابة ذرية بين الخيوط
+            d = _sec_cache_load()
+            sec = d.setdefault(section, {})
+            sec[key] = {"v": value, "t": time.time()}
+            if len(sec) > _SEC_CACHE_MAX:  # حد أقصى ضد تضخم الملف
+                old = sorted(sec.items(), key=lambda kv: kv[1].get("t", 0))
+                for k, _ in old[: len(sec) - _SEC_CACHE_MAX]:
+                    sec.pop(k, None)
+            _sec_cache_save(d)
     except Exception:
         pass
 
@@ -436,15 +489,14 @@ def _goplus_security(chain, address):
     مصدر احتياطي: يُستدعى فقط عند فشل المصدر الأساسي
     (honeypot.is / RugCheck) — فلسفة التدوير القاسي: الفشل الفوري
     ينتقل للبديل في نفس اللحظة بدل رفض العملة."""
-    global _GOPLUS_LAST_CODE
-    _GOPLUS_LAST_CODE = None
+    _tls.goplus_code = None
     gid = GOPLUS_CHAIN_IDS.get(chain)
     if not gid or not address:
         return None
     data = _get(f"{GOPLUS_API}/api/v1/token_security/{gid}",
                 params={"contract_addresses": address})
     if data is not None:
-        _GOPLUS_LAST_CODE = data.get("code")
+        _tls.goplus_code = data.get("code")
     if not data or str(data.get("code")) != "1":
         return None
     info = (data.get("result") or {}).get((address or "").lower()) or {}
@@ -469,27 +521,25 @@ def _goplus_security(chain, address):
 
 def _http_desc():
     """وصف مقروء لآخر فشل HTTP — للتشخيص في السجلات."""
-    s = _get.last_status
+    s = _last_status()
     return "network/timeout" if s == 0 else f"HTTP {s}"
 
 
 def _goplus_desc():
     """سبب فشل GoPlus بدقة: يميّز حمولة الخطأ (HTTP 200 + code≠1)
     عن فشل الشبكة — لأن GoPlus يرد أحياناً 200 مع {"code":5000}."""
-    s = _get.last_status
-    c = _GOPLUS_LAST_CODE
+    s = _last_status()
+    c = getattr(_tls, "goplus_code", None)
     if s == 200 and c is not None and str(c) != "1":
         return f"HTTP 200 + error payload (code {c})"
     return _http_desc()
 
 
-# آخر سبب لفشل فحص الأمان (سلسلة المصادر الفاشلة) — يقرأها المحلل
-# لعرض السبب الحقيقي في السجل بدل "API لا يستجيب" الغامضة.
-# تُصفَّر مع كل فحص جديد؛ الفشل لا يُخزَّن في الكاش (fail-closed محفوظ).
+# ملاحظة: أسباب فشل فحص الأمان أصبحت thread-local (عبر _tls) وتُمرَّر
+# صراحة كقيمة معادة (res, err) — بلا globals تتسابق بين الخيوط.
+# الأسماء القديمة أُبقيت كمهملات للتوافق الخلفي فقط.
 LAST_SEC_ERROR = None
-# كود حمولة GoPlus الأخير (لتمييز "HTTP 200 بحمولة خطأ" عن فشل الشبكة)
 _GOPLUS_LAST_CODE = None
-# هل ردّ RugCheck بحمولة غير صالحة رغم HTTP 200؟
 _RUGCHECK_BAD_PAYLOAD = False
 
 
@@ -497,24 +547,23 @@ def _token_security_live(chain, address):
     """يفحص: هل البيع مستحيل؟ ما الضرائب؟ ما مستوى الخطر؟
     EVM → honeypot.is ثم GoPlus | Solana → RugCheck ثم GoPlus.
     الفشل المزدوج فقط = مجهول (fail-closed محفوظ: الرفض الآمن يبقى).
-    عند الفشل: LAST_SEC_ERROR تحمل سبب كل مصدر — لا مزيد من التخمين."""
-    global LAST_SEC_ERROR
-    LAST_SEC_ERROR = None
+    يعيد (النتيجة, سبب_الفشل) — السبب يُمرَّر صراحة بدل global
+    (آمن للخيوط عند الفحص المتوازي)."""
     errs = []
     if chain == "solana":
         r = _solana_security(address)
         if r:
-            return r
-        if _get.last_status == 200 and _RUGCHECK_BAD_PAYLOAD:
+            return r, None
+        if _last_status() == 200 and getattr(
+                _tls, "rugcheck_bad_payload", False):
             errs.append("RugCheck: HTTP 200 + invalid payload")
         else:
             errs.append(f"RugCheck: {_http_desc()}")
         g = _goplus_security(chain, address)
         if g:
-            return g
+            return g, None
         errs.append(f"GoPlus: {_goplus_desc()}")
-        LAST_SEC_ERROR = " ← ".join(errs)
-        return None
+        return None, " ← ".join(errs)
     chain_id = HONEYPOT_CHAIN_IDS.get(chain)
     if chain_id:
         data = _get(f"{HONEYPOT_API}/IsHoneypot",
@@ -531,17 +580,16 @@ def _token_security_live(chain, address):
                 "risk_level": _num(summary.get("riskLevel")),
                 "holders": _num((data.get("token") or {}).get("totalHolders")),
                 "lp_locked": 0,
-            }
-        if _get.last_status == 200 and data:
+            }, None
+        if _last_status() == 200 and data:
             errs.append("honeypot.is: HTTP 200 + invalid payload")
         else:
             errs.append(f"honeypot.is: {_http_desc()}")
     g = _goplus_security(chain, address)
     if g:
-        return g
+        return g, None
     errs.append(f"GoPlus: {_goplus_desc()}")
-    LAST_SEC_ERROR = " ← ".join(errs) if errs else "unknown"
-    return None
+    return None, (" ← ".join(errs) if errs else "unknown")
 
 
 def token_security(chain, address):
@@ -549,27 +597,27 @@ def token_security(chain, address):
     1) honeypot.is (لـ EVM) / RugCheck (لـ Solana)،
     2) GoPlus كبديل تلقائي عند فشل الأول،
     3) safe-skip: إذا فشل المصدران معاً تبقى fail-closed — العملة غير
-       القابلة للتحقق تُرفض مع السبب الدقيق (LAST_SEC_ERROR)، والفحص
+       القابلة للتحقق تُرفض مع السبب الدقيق، والفحص
        يكمل فوراً للعملة التالية. البوت لا يتوقف أبداً بسبب API أمان.
     العناوين المفحوصة خلال 6 ساعات تُقرأ من الكاش (0 طلبات API).
-    الفشل لا يُخزَّن: fail-closed محفوظ."""
+    الفشل لا يُخزَّن: fail-closed محفوظ.
+    يعيد (النتيجة, سبب_الفشل) — آمن للاستدعاء المتوازي."""
     key = f"{chain}:{(address or '').lower()}"
     hit = _sec_cached(key, "token_security")
     if hit is not None:
-        return hit
-    res = _token_security_live(chain, address)
+        return hit, None
+    res, err = _token_security_live(chain, address)
     _sec_store(key, "token_security", res)
-    return res
+    return res, err
 
 
 def _solana_security(mint):
-    global _RUGCHECK_BAD_PAYLOAD
-    _RUGCHECK_BAD_PAYLOAD = False
+    _tls.rugcheck_bad_payload = False
     data = _get(f"{RUGCHECK_API}/v1/tokens/{mint}/report/summary")
     if not data:
         return None
     if "risks" not in data:
-        _RUGCHECK_BAD_PAYLOAD = True  # HTTP 200 لكن بلا حقل risks
+        _tls.rugcheck_bad_payload = True  # HTTP 200 لكن بلا حقل risks
         return None
     risks = data.get("risks") or []
     dangers = [r for r in risks if r.get("level") == "danger"]
@@ -899,27 +947,43 @@ class NewsClient:
                       "dupes_merged": 0, "dropped_short": 0}
 
     def fetch(self):
-        items = []
-        for feed in self.feeds:
+        """يجلب كل الخلاصات متوازية (كانت متسلسلة: 22 خلاصة × ~1-2 ثانية).
+        يُستخدم _session المشترك (إعادة استعمال اتصالات TLS) مع حد 2MB
+        لكل خلاصة ضد تضخيم XML الخبيث. الدمج والإحصاء في الخيط الرئيسي."""
+        def _one(feed):
             name, url = feed[0], feed[1]
             tier = feed[2] if len(feed) > 2 else 3
             try:
-                req = urllib.request.Request(
-                    url, headers={"User-Agent": BROWSER_UA})
-                # حد أقصى 2MB قبل التحليل: خلاصات RSS الحقيقية أصغر بكثير —
-                # أي شيء أكبر = تضخيم كيانات XML خبيث (billion laughs) أو تلف
-                raw = urllib.request.urlopen(req, timeout=12).read(2_000_000)
+                with _session.get(
+                        url, timeout=12, stream=True,
+                        headers={"User-Agent": BROWSER_UA,
+                                 "Accept": ("application/rss+xml, "
+                                            "application/xml, text/xml, */*")},
+                ) as r:
+                    if r.status_code != 200:
+                        return (name, [], False)
+                    # حد أقصى 2MB قبل التحليل: خلاصات RSS الحقيقية أصغر
+                    # بكثير — أي شيء أكبر = تضخيم كيانات XML خبيث
+                    # (billion laughs) أو تلف
+                    raw = r.raw.read(2_000_000)
                 root = ET.fromstring(raw)
                 got = (self._parse_rss(root, name, tier)
                        + self._parse_atom(root, name, tier))
-                if got:
-                    self.stats["sources_ok"] += 1
-                else:
-                    self.stats["sources_fail"] += 1
-                items += got
+                return (name, got, bool(got))
             except Exception:
+                return (name, [], False)
+
+        items = []
+        for _r in pmap(_one, list(self.feeds), max_workers=8):
+            if not _r:
                 self.stats["sources_fail"] += 1
                 continue
+            _name, got, ok = _r
+            if ok:
+                self.stats["sources_ok"] += 1
+            else:
+                self.stats["sources_fail"] += 1
+            items += got
         cutoff = datetime.now(timezone.utc) - timedelta(hours=self.hours)
         filtered = []
         for it in items:
