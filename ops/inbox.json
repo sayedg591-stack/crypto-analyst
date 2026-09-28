@@ -1,6 +1,6 @@
 {
-  "id": "timers-20260928-0920",
-  "cmd": "echo '==TIMERS==' && systemctl list-timers --all --no-pager 2>&1 | head -25; echo '==DATE==' && date -u +%FT%TZ && date +%FT%TZ",
-  "timeout": 30,
-  "note": "list systemd timers and check timezone"
+  "id": "traptest-20260928-0925",
+  "cmd": "bash -x /home/ubuntu/bot/freeze-watch.sh 2>&1 | head -30; echo '==EXIT:$?=='",
+  "timeout": 40,
+  "note": "manually test trap script with trace"
 }
