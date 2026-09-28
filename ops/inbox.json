@@ -1,6 +1,1 @@
-{
-  "id": "traptest-20260928-0925",
-  "cmd": "bash -x /home/ubuntu/bot/freeze-watch.sh 2>&1 | head -30; echo '==EXIT:$?=='",
-  "timeout": 40,
-  "note": "manually test trap script with trace"
-}
+{"id": "trapfix2-20260928-0930", "cmd": "printf '%s\n' '#!/bin/bash' 'GIST_ID=7181de8f94858379915d85d0a04bcbef' 'LOG=/home/ubuntu/bot/freeze-capture.log' 'AGE=$(curl -s --max-time 15 https://api.github.com/gists/$GIST_ID | python3 -c \"import json,sys,datetime; d=json.load(sys.stdin); ua=d.get( chr(39)+chr(39), chr(39)+chr(39)); print(0)\" 2>/dev/null)' 'echo test > /tmp/trapworks' > /home/ubuntu/bot/freeze-watch.sh && chmod +x /home/ubuntu/bot/freeze-watch.sh && cat /home/ubuntu/bot/freeze-watch.sh", "timeout": 30, "note": "test simple trap write"}
