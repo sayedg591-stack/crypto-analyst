@@ -263,7 +263,7 @@ def build_context(s):
     # يعمل فقط عند وجود الأسرار، وإلا يُتجاهل بصمت تام
     if USE_XBRIDGE:
         try:
-            import tracebackbridge
+            import xbridge
             xb = xbridge.fetch_xbridge_news(max_age_h=XBRIDGE_MAX_AGE_H)
             if xb:
                 ctx["news"] = (ctx.get("news") or []) + xb
