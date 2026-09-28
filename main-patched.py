@@ -1,0 +1,1723 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""المشغّل الرئيسي: فحص العملات الجديدة → تحليل → تنبيه → متابعة الصفقات."""
+import argparse
+import html
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+import clients
+import analyzer
+import alerts
+import expert
+import state as st
+from statelock import state_locked
+from config import (
+    CHAINS, SCAN_LIMIT, MIN_LIQUIDITY_USD, MIN_VOLUME_24H_USD,
+    MIN_TXNS_24H, MAX_PAIR_AGE_DAYS, WATCHLIST, TAKE_PROFITS, STOP_LOSS,
+    TRAIL_PCT, MOMENTUM_CUTOFF_H, MOMENTUM_MIN_GAIN,
+    POSITION_MAX_AGE_H, DIGEST_HOURS_UTC, USE_COINGECKO, USE_NEWS,
+    USE_FNG, NEW_ALERT_MAX_AGE_H, WAITLIST_MAX_AGE_H, WAITLIST_MAX_SIZE,
+    WAITLIST_ADD_PER_RUN, POS_REEVAL_MIN_SCORE, POS_REEVAL_MIN_AGE_H,
+    VOL_SPIKE_MULT, VOL_SPIKE_LOOKBACK, VOL_SPIKE_COOLDOWN_H,
+    PAPER_ENABLED, PAPER_START_BALANCE, PAPER_RISK_PER_TRADE,
+    PAPER_SELL_FRACTIONS, PAPER_SLIPPAGE, PAPER_MAX_OPEN,
+    DISCOVERY_TOKEN_CAP,
+    CIRCUIT_BREAKER_SL_STREAK, CIRCUIT_BREAKER_HALT_H, SL_COOLDOWN_H,
+    DEATH_LIQ_USD, DEATH_VOL_M5_USD, DEATH_NOBUY_MIN_SELLS,
+    DEATH_CONFIRM_MIN, DEATH_MIN_AGE_H,
+    USE_XBRIDGE, XBRIDGE_MAX_AGE_H,
+    MIN_PROBABILITY, OPS_INBOX_ENABLED, STRATEGY_VERSION,
+)
+
+# عتبات الانهيار والقائمة السوداء
+RUG_ALERT_LOSS = 0.70      # خسارة ≥70% فجأة → رسالة "انهيار" بدل وقف الخسارة
+RUG_BLACKLIST_LOSS = 0.80  # خسارة ≥80% → العملة + مطورها إلى القائمة السوداء
+
+# الوحدات البحثية الثقيلة (2026-09-25): كلها fail-safe — استيرادها لا
+# يرفع أبداً، وغياب أي منها (مكتبة ناقصة) يعني ببساطة تخطي ميزتها
+# دون أي أثر على الفحص أو الصفقات أو التنبيهات.
+try:
+    import store as market_store
+except Exception:
+    market_store = None
+try:
+    import nlp as nlp_scorer
+except Exception:
+    nlp_scorer = None
+try:
+    import calibrate
+except Exception:
+    calibrate = None
+try:
+    import resources as vm_resources
+except Exception:
+    vm_resources = None
+
+
+def _flow_candidates(res):
+    """صيغ Binance المرشحة لرمز الصفقة (BONK → BONKUSDT) — لحارس السيولة."""
+    cands, seen = [], set()
+    for raw in (res.get("symbol"), res.get("pair")):
+        if not raw:
+            continue
+        s = str(raw).upper().replace("/", "").replace("-", "").replace(" ", "")
+        for q in ("USDT", "USDC", "USD", "FDUSD", "TUSD", "BUSD"):
+            if s.endswith(q) and len(s) > len(q):
+                s = s[: -len(q)]
+                break
+        f = s + "USDT"
+        if f not in seen:
+            seen.add(f)
+            cands.append(f)
+    return cands
+
+
+def _flow_veto(res):
+    """يسأل محرك التدفق (flow.py) عبر ZeroMQ: هل هذه العملة في
+    DANGER_WHALE_DUMP (حيتان تبيع بقوة)؟
+    يرجع (vetoed: bool, info: dict|None) — fail-safe بالكامل:
+    غياب pyzmq/المحرك/البيانات = (False, None) — لا يمنع التداول أبداً."""
+    try:
+        import zmq
+    except Exception:
+        return False, None
+    cands = _flow_candidates(res)
+    if not cands:
+        return False, None
+    sock = None
+    try:
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.REQ)
+        sock.setsockopt(zmq.SNDTIMEO, 200)
+        sock.setsockopt(zmq.RCVTIMEO, 200)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect("tcp://127.0.0.1:5559")
+        for cand in cands:
+            try:
+                sock.send_json({"sym": cand})
+                rep = sock.recv_json()
+            except Exception:
+                return False, None  # مهلة — المحرك غائب: لا فيتو
+            if not isinstance(rep, dict) or rep.get("state") == "UNKNOWN":
+                continue
+            info = {"sym": cand, "state": rep.get("state"),
+                    "cvd_5m": rep.get("cvd_5m"), "obi": rep.get("obi"),
+                    "z": rep.get("z")}
+            return (rep.get("state") == "DANGER_WHALE_DUMP"), info
+        return False, None
+    except Exception:
+        return False, None
+    finally:
+        try:
+            if sock is not None:
+                sock.close()
+        except Exception:
+            pass
+
+
+def _read_daemon_status(s):
+    """يقرأ ملفات حالة العمال (التدفق اللحظي + مختبر الأبحاث)
+    إلى state — قراءة ملفات محلية فقط، fail-safe بالكامل.
+    لا يبدأ أي عملية؛ الإشراف مهمة cron/systemd."""
+    try:
+        home = os.environ.get("HOME") or os.path.expanduser("~")
+        for key, fname in (("flow", "flow_status.json"),
+                           ("research2", "research2_status.json")):
+            p = os.path.join(home, "bot", fname)
+            try:
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    s[key] = data
+            except Exception:
+                continue
+    except Exception as _e:
+        print("daemon status skipped:", _e)
+
+
+def _rug_store(s):
+    return s.setdefault("rug_blacklist", {})
+
+
+def blacklist_rug(s, pos, loss_pct):
+    """تسجيل عملة منهارة في القائمة السوداء مع عنوان مطورها (إن عُرف
+    عبر RugCheck) — أي عملة جديدة من نفس المطور تُحظر تلقائياً."""
+    key = (pos.get("mint") or "").lower() or (pos.get("symbol") or "")
+    if not key:
+        return False
+    bl = _rug_store(s)
+    if key in bl:
+        return True
+    dev = None
+    if pos.get("kind") == "dex" and pos.get("chain") == "solana" \
+            and pos.get("mint"):
+        dev = clients.rugcheck_creator(pos["mint"])
+    bl[key] = {"name": pos.get("name"), "dev": dev,
+               "time": time.time(), "loss": round(loss_pct * 100, 1)}
+    if dev:
+        devs = s.setdefault("rug_devs", [])
+        if dev not in devs:
+            devs.append(dev)
+    print(f"  -> ⛔ قائمة سوداء: {pos.get('name')} "
+          f"(مطور: {dev or 'غير معروف'})")
+    return True
+
+
+def is_blacklisted(s, mint=None, symbol=None, chain=None):
+    """هل العملة أو مطورها في القائمة السوداء؟"""
+    bl = s.get("rug_blacklist") or {}
+    if mint and mint.lower() in bl:
+        return True, "العملة مسجلة في القائمة السوداء (انهيار سابق)"
+    if symbol and symbol in bl:
+        return True, "العملة مسجلة في القائمة السوداء (انهيار سابق)"
+    if chain == "solana" and mint:
+        dev = clients.rugcheck_creator(mint)
+        if dev and dev in (s.get("rug_devs") or []):
+            return True, "مطور العملة في القائمة السوداء (سجل انهيارات)"
+    return False, None
+
+
+def build_context(s):
+    """سياق الخبير: الأخبار الموثوقة + العملات الرائجة + نبض مُتحقق + ذاكرة النتائج.
+    الكتل الخمس مستقلة تماماً → تُنفَّذ متوازية (كانت متسلسلة)."""
+    ctx = {"news": [], "trending": [], "macro": None, "nc": None,
+           "fng": None, "news_stats": {}}
+
+    def _news_block():
+        if not USE_NEWS:
+            return None
+        try:
+            nc = clients.NewsClient()
+            items = nc.fetch()
+            # معنويات محلية (نموذج ONNX على الجهاز — بلا حصة API):
+            # تُعيد تقييم معنويات العناوين؛ عند غياب النموذج يبقى
+            # التقييم الحالي لأن البديل مطابق له حرفياً (نفس الكلمات)
+            if nlp_scorer is not None:
+                try:
+                    for _it in (items or []):
+                        _it["sentiment"] = nlp_scorer.score(
+                            _it.get("title"))
+                except Exception as _e:
+                    print("nlp rescore skipped:", _e)
+            return (items, nc, dict(nc.stats))
+        except Exception as e:
+            print("news error:", e)
+            return None
+
+    def _trend_block():
+        if not USE_COINGECKO:
+            return None
+        try:
+            # سلسلة احتياطية: CoinGecko → CoinPaprika (تلقائي)
+            tr, tr_src = clients.trending_chain(s)
+            return (tr or [], tr_src)
+        except Exception:
+            return None
+
+    def _macro_block():
+        if not USE_COINGECKO:
+            return None
+        try:
+            return clients.verified_macro()
+        except Exception:
+            return None
+
+    def _fng_block():
+        if not USE_FNG:
+            return None
+        try:
+            return clients.fear_greed()
+        except Exception:
+            return None
+
+    def _reddit_block():
+        # ضجة Reddit العضوية (ذكرات $TICKER — مصدر ناعم بحد أقصى)
+        try:
+            return clients.reddit_mentions()
+        except Exception:
+            return None
+
+    _nr, _tr, _mc, _fg, _rd = clients.pmap(
+        lambda f: f(),
+        [_news_block, _trend_block, _macro_block, _fng_block, _reddit_block],
+        max_workers=5)
+
+    if _nr:
+        items, nc, stats = _nr
+        ctx["news"] = items
+        ctx["nc"] = nc
+        ctx["news_stats"] = stats
+        print(f"أخبار: {len(items)} عنواناً من "
+              f"{stats['sources_ok']} مصادر موثوقة "
+              f"(مكرر مُزال: {stats['dupes_merged']})")
+        if nlp_scorer is not None:
+            print(f"  -> معنويات محلية [{nlp_scorer.backend()}]")
+    # جسر أخبار X عبر قنوات Telegram (Telethon) — تلميحات إضافية بأدنى ثقة
+    # يعمل فقط عند وجود الأسرار، وإلا يُتجاهل بصمت تام
+    if USE_XBRIDGE:
+        try:
+            import xbridge
+            xb = xbridge.fetch_xbridge_news(max_age_h=XBRIDGE_MAX_AGE_H)
+            if xb:
+                ctx["news"] = (ctx.get("news") or []) + xb
+                print(f"أخبار X⇄TG: {len(xb)} عنصراً من قنوات Telegram")
+        except Exception as e:
+            print("xbridge error:", e)
+    if _tr:
+        tr, tr_src = _tr
+        ctx["trending"] = tr
+        print(f"الرائجة الآن: {len(tr)} عملة [{tr_src}]")
+    if _mc:
+        ctx["macro"] = _mc
+        m = _mc
+        if m.get("btc_chg") is not None:
+            nsrc = m.get("macro_sources", 2)
+            v = "✓ مُتحقق" if m.get("verified") else "؟ غير مؤكد"
+            print(f"BTC: {m['btc_chg']:+.1f}% (24س) [{v} من {nsrc} مصادر]")
+    if _fg:
+        ctx["fng"] = _fg
+        print(f"الخوف والطمع: {_fg['value']}/100 ({_fg['label']})")
+    if _rd:
+        ctx["reddit"] = _rd
+        top = sorted(_rd.items(), key=lambda kv: kv[1],
+                     reverse=True)[:3]
+        print(f"Reddit: {len(_rd)} رمزاً مذكوراً "
+              f"(أعلاها: {', '.join(f'${k}×{v}' for k, v in top)})")
+    ctx["band_stats"] = st.band_stats(s)
+    # عدد الصفقات المغلقة — يحدد وزن نموذج المعايرة (0 = الأحكام وحدها)
+    try:
+        ctx["n_closed_trades"] = len(
+            (s.get("paper") or {}).get("closed_trades") or [])
+    except Exception:
+        ctx["n_closed_trades"] = 0
+    return ctx
+
+
+def coin_symbol(res):
+    """يستخرج رمز العملة من نتيجة التحليل."""
+    if res.get("symbol"):
+        return res["symbol"].replace("USDT", "")
+    return (res.get("display") or "").split("/")[0]
+
+
+def make_verdict(res, ctx):
+    nc = ctx.get("nc")
+    sym = coin_symbol(res)
+    coin_news = nc.for_coin(sym) if nc else []
+    macro = ctx.get("macro") or {}
+    trending = [t.get("symbol") for t in (ctx.get("trending") or [])
+                if t.get("symbol")]
+    # مشاعر Stocktwits للعملة (تُجلب فقط للإشارات الحقيقية — ≤5 في الفحص)
+    social = None
+    try:
+        social = clients.stocktwits_sentiment(sym)
+    except Exception:
+        pass
+    verdict = expert.decide(res, coin_news, macro.get("btc_chg"),
+                            ctx.get("band_stats"),
+                            fng=ctx.get("fng"),
+                            macro_verified=macro.get("verified", False),
+                            trending=trending, reddit=ctx.get("reddit"),
+                            social=social)
+    # معايرة الاحتمال (أحكام الخبراء + نموذج ML عند نضجه): تُحسّن الرقم
+    # فقط — عتبات الدخول (SCORE_BUY/MIN_PROBABILITY) لا تتغير أبداً
+    if calibrate is not None:
+        try:
+            verdict["prob"], verdict["news_sent"] = _calibrated_prob(
+                res, verdict, coin_news, ctx)
+        except Exception as _e:
+            print("calibrate skipped:", _e)
+            verdict.setdefault("news_sent", None)
+    else:
+        verdict.setdefault("news_sent", None)
+    return verdict
+
+
+_cal_model = None  # نموذج sklearn — يُحمَّل كسولاً مرة واحدة لكل عملية
+
+
+def _has_listing_rumor(coin_news):
+    """هل تذكر الأخبار شائعة إدراج؟ (حارس تلفيق: الشائعة بلا حجم = خطر)"""
+    try:
+        for n in (coin_news or []):
+            t = (n.get("title") or "").lower()
+            if "listing" in t or "list on" in t or "lists on" in t:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _calibrated_prob(res, verdict, coin_news, ctx):
+    """يبني سمات المعايرة من المقاييس ويطبق calibrate.adjust.
+
+    يعيد (الاحتمال المعاير، متوسط معنويات أخبار العملة).
+    لا يرفع استثناءً — عند الشك يعيد احتمال expert.decide كما هو."""
+    global _cal_model
+    m = res.get("metrics") or {}
+    buys = m.get("buys") or 0
+    sells = m.get("sells") or 0
+    bp = (buys / (buys + sells)) if (buys + sells) > 0 else None
+    news_sent = None
+    if coin_news:
+        try:
+            news_sent = (sum(n.get("sentiment", 0) for n in coin_news)
+                         / len(coin_news))
+        except Exception:
+            news_sent = None
+    features = {
+        "score": res.get("score"),
+        "liq_usd": m.get("liq"),
+        "mcap_usd": m.get("fdv") or m.get("mcap"),
+        "buy_pressure": bp,
+        "buys": buys,
+        "sells": sells,
+        "vol_mult": m.get("vol_mult"),
+        "atr_pct": m.get("atr_pct"),
+        "sentiment": news_sent,
+        "chain": res.get("chain"),
+        "age_h": m.get("age_h"),
+        "boosted": bool(res.get("boosted")),
+        "listing_rumor": _has_listing_rumor(coin_news),
+    }
+    if _cal_model is None:
+        _cal_model = calibrate.load_model()
+    n_trades = ctx.get("n_closed_trades") or 0
+    prob = calibrate.adjust(verdict.get("prob"), features,
+                            model=_cal_model, n_trades=n_trades)
+    try:
+        prob = int(round(prob))
+    except (TypeError, ValueError):
+        prob = verdict.get("prob")
+    return prob, news_sent
+
+
+_ms = None  # مخزن السوق المشترك — يُفتح كسولاً مرة لكل عملية
+
+
+def _get_store():
+    """مخزن مشترك واحد (تجنّب إعادة الاتصال لكل صفقة). لا يرفع أبداً."""
+    global _ms
+    if _ms is None and market_store is not None:
+        try:
+            _ms = market_store.MarketStore()
+        except Exception as e:
+            print("market store unavailable:", e)
+            _ms = False  # علّم الفشل حتى لا نعيد المحاولة كل مرة
+    return _ms if _ms is not False else None
+
+
+def _snapshot_results(results):
+    """لقطات سوقية للعملات المقيّمة في الفحص — وقود الباكتست والمعايرة.
+    لا يرفع أبداً."""
+    try:
+        ms = _get_store()
+        if ms is None:
+            return
+        n = 0
+        for res in (results or []):
+            m = res.get("metrics") or {}
+            if ms.record_snapshot(
+                    chain=res.get("chain"), pair=res.get("pair"),
+                    symbol=res.get("symbol"),
+                    price_usd=m.get("price"), vol_24h_usd=m.get("vol24"),
+                    liq_usd=m.get("liq"), mcap_usd=m.get("fdv"),
+                    buys=m.get("buys"), sells=m.get("sells"),
+                    sentiment=None, source="scan"):
+                n += 1
+        if n:
+            print(f"  -> مخزن السوق: {n} لقطة جديدة")
+    except Exception as e:
+        print("snapshot_results skipped:", e)
+
+
+def _snapshot_position(pos, price, liq):
+    """لقطة سعرية لصفقة مفتوحة — تُستدعى من مسار المتابعة (بلا API
+    إضافي). لا يرفع أبداً."""
+    try:
+        ms = _get_store()
+        if ms is None:
+            return
+        ms.record_snapshot(
+            chain=pos.get("chain"), pair=pos.get("pair"),
+            symbol=pos.get("symbol"), price_usd=price,
+            liq_usd=liq, source="monitor")
+    except Exception as e:
+        print("snapshot_position skipped:", e)
+
+
+def pick_best_pair(pairs):
+    """لكل عملة: اختر زوج التداول الأعلى سيولة."""
+    best = {}
+    for p in pairs:
+        try:
+            base = p["baseToken"]["address"].lower()
+        except Exception:
+            continue
+        liq = float((p.get("liquidity") or {}).get("usd") or 0)
+        key = (p.get("chainId"), base)
+        if key not in best or liq > best[key][1]:
+            best[key] = (p, liq)
+    return [p for p, _ in best.values()]
+
+
+def _demote_to_watch(s, res, verdict):
+    """صفقة تحت عتبة الثقة: تُنقل للمراقبة بدل الدخول —
+    لا تنبيه Telegram ولا صفقة وهمية. تُعاد فحصها في الجولات القادمة
+    (قد تتحسن مؤشراتها فتتجاوز العتبة)."""
+    wl = s.setdefault("waitlist", {})
+    wid = res["id"]
+    if wid in wl:
+        wl[wid]["score"] = res.get("score")  # تحديث النقاط للجولة القادمة
+    elif len(wl) < WAITLIST_MAX_SIZE:
+        wl[wid] = {
+            "chain": res.get("chain"), "pair": res.get("pair"),
+            "display": res.get("display"), "score": res.get("score"),
+            "added": time.time(), "checks": 0,
+        }
+    print(f"  -> ⏸ تحت عتبة الثقة ({verdict['prob']}% < {MIN_PROBABILITY}%): "
+          f"{res.get('display')} — مراقبة فقط")
+
+
+def below_threshold(verdict):
+    """هل نسبة النجاح التقديرية تحت الحد الأدنى للدخول؟"""
+    try:
+        return int(verdict.get("prob", 0)) < MIN_PROBABILITY
+    except (TypeError, ValueError):
+        return True  # رقم غير صالح = لا دخول (افتراض آمن)
+
+
+def _note_prefilter_reject(p, reason):
+    """توثيق الرفض المبكر لطبقة البحث — fail-safe تماماً، لا يغيّر أي قرار."""
+    try:
+        import research
+        research.note_prefilter_reject(p, reason)
+    except Exception:
+        pass
+
+
+def scan_new_coins(s, dry_run, ctx):
+    print("=== فحص العملات الجديدة ===")
+    # الاكتشاف: 4 مصادر مستقلة → متوازية (كانت متسلسلة)
+    _disc = clients.pmap(
+        lambda f: f() or [],
+        [clients.latest_profiles, clients.latest_boosts,
+         clients.top_boosts, clients.geckoterminal_tokens],
+        max_workers=4)
+    profiles, boosts, tops, gecko = _disc
+    boosted_set = {(c, a.lower()) for c, a in boosts}
+    tokens = profiles + boosts + tops + gecko
+    seen, uniq = set(), []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    print(f"عناوين مرشحة: {len(uniq)} (منها {len(boosted_set)} بترويج مدفوع، "
+          f"{len(tops)} أعلى ترويج، {len(gecko)} من GeckoTerminal)")
+
+    pairs = clients.pairs_for_tokens(uniq[:DISCOVERY_TOKEN_CAP])
+    now_ms = time.time() * 1000
+    cands = []
+    for p in pick_best_pair(pairs):
+        liq = float((p.get("liquidity") or {}).get("usd") or 0)
+        vol = float((p.get("volume") or {}).get("h24") or 0)
+        tx = (p.get("txns") or {}).get("h24") or {}
+        ntx = float(tx.get("buys") or 0) + float(tx.get("sells") or 0)
+        created = p.get("pairCreatedAt") or 0
+        age_d = (now_ms - created) / 86400000 if created else 0
+        if liq < MIN_LIQUIDITY_USD:
+            _note_prefilter_reject(p, "REJECTED_LIQUIDITY")
+            continue
+        if vol < MIN_VOLUME_24H_USD:
+            _note_prefilter_reject(p, "REJECTED_VOLUME")
+            continue
+        if ntx < MIN_TXNS_24H:   # تنقية: عملات بلا نشاط حقيقي = ضجيج
+            _note_prefilter_reject(p, "REJECTED_TXNS")
+            continue
+        if created and age_d * 24 > NEW_ALERT_MAX_AGE_H:
+            _note_prefilter_reject(p, "REJECTED_AGE")
+            continue  # الفرص الحقيقية في الساعات الأولى فقط
+        # فلتر الرمز المشبوه (حروف خفية / تقليد عملات مشهورة)
+        sym = ((p.get("baseToken") or {}).get("symbol") or "")
+        ok, why = analyzer.check_symbol(sym)
+        if not ok:
+            print(f"  x رمز مرفوض {sym[:20]!r}: {why}")
+            _note_prefilter_reject(p, "REJECTED_SYMBOL")
+            continue
+        cands.append(p)
+    cands.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
+               reverse=True)
+    cands = cands[:SCAN_LIMIT]
+    print(f"مرشحون بعد التصفية: {len(cands)}")
+
+    # I/O متوازٍ: فحص الأمان + تركيز الحيتان لكل مرشح
+    # (كان متسلسلاً: حتى 40 عملة × طلبين). التحليل نفسه يبقى متسلسلاً.
+    def _sec_one(p):
+        chain = p.get("chainId")
+        addr = (p.get("baseToken") or {}).get("address")
+        sec, sec_err = clients.token_security(chain, addr) \
+            if addr else (None, None)
+        holders = (clients.solana_top10_pct(addr)
+                   if (chain == "solana" and addr) else None)
+        return (p, sec, sec_err, holders)
+
+    _fetched = clients.pmap(_sec_one, cands, max_workers=10)
+    results = []
+    for _r in _fetched:
+        if not _r:
+            continue
+        p, sec, sec_err, holders = _r
+        # حارس «لا تتوقف أبداً»: عملة واحدة فاسدة/استثناء غير متوقع
+        # يجب ألا يقتل الفحص كله — تُسجَّل ويُكمل للعملة التالية.
+        try:
+            chain = p.get("chainId")
+            addr = (p.get("baseToken") or {}).get("address")
+            # فحص السلامة: زوج بلا سعر = بيانات ناقصة — يُتجاهل (لا قرارات على فراغ)
+            if not analyzer._f(p.get("priceUsd")):
+                _note_prefilter_reject(p, "REJECTED_NO_PRICE")
+                continue
+            boosted = (chain, (addr or "").lower()) in boosted_set
+            # الافتراض الآمن: فشل فحص الأمان لعملة بعنوان معروف = مرفوضة
+            sec_failed = bool(addr) and sec is None
+            # 🐋 فحص تركيز الحيتان (Solana فقط — مجاني بلا مفتاح عبر RugCheck)
+            res = analyzer.analyze_pair(p, sec, boosted=boosted, holders=holders,
+                                        security_unknown=sec_failed,
+                                        security_error=sec_err
+                                        if sec_failed else None)
+            res["id"] = f"dex:{chain}:{p.get('pairAddress')}"
+            res["kind"] = "dex"
+            res["chain"] = chain
+            res["pair"] = p.get("pairAddress")
+            res["mint"] = addr
+            # طبقة البحث (Phase 1): إرفاق البيانات الخام للتوثيق فقط —
+            # لا تغيّر أي قرار (تُقرأ لاحقاً من research.run_collection)
+            res["_pair"] = p
+            res["_sec"] = sec
+            results.append(res)
+        except Exception as _e:
+            print(f"  ⚠️ عملة متخطاة (خطأ غير متوقع): {_e}")
+            try:
+                _note_prefilter_reject(p, "REJECTED_ERROR")
+            except Exception:
+                pass
+            continue
+
+    results.sort(key=lambda r: r["score"], reverse=True)
+    sent = 0
+    wait_added = 0
+    for res in results:
+        key = f"sig:{res['id']}"
+        if time.time() - s["alerted"].get(key, 0) < 24 * 3600:
+            continue
+        if res["signal"] in ("BUY", "STRONG_BUY") and sent < 5:
+            bad, why = is_blacklisted(s, mint=res.get("mint"),
+                                      chain=res.get("chain"))
+            if bad:
+                print(f"  -> ⛔ محظورة (قائمة سوداء): {res['display']} — {why}")
+                _note_prefilter_reject(res.get("_pair") or {}, "REJECTED_BLACKLIST")
+                continue
+            verdict = make_verdict(res, ctx)
+            # طبقة البحث (Phase 1): توثيق الاحتمال المحسوب فقط — لا يغيّر شيئاً
+            res["_verdict_prob"] = verdict.get("prob")
+            res["_verdict_sent"] = verdict.get("news_sent")
+            print(f"  -> إشارة {res['signal']}: {res['display']} "
+                  f"({res['score']}) نجاح~{verdict['prob']}%")
+            # عتبة الثقة: نسبة ضعيفة = مراقبة فقط (لا دخول ولا تنبيه)
+            if below_threshold(verdict):
+                _demote_to_watch(s, res, verdict)
+                continue
+            # التنبيه لا يُرسل إلا بعد فتح الصفقة (متابعة + وهمية) بنجاح
+            if not open_position(s, res, verdict):
+                continue
+            alerts.send(alerts.new_signal_msg(res, verdict), dry_run)
+            s["alerted"][key] = time.time()
+            sent += 1
+            s["stats"]["signals_today"] = s["stats"].get("signals_today", 0) + 1
+        elif res["signal"] == "AVOID" and any("⛔" in w for w in res["warnings"]) \
+                and sent < 6:
+            # بأمر المستخدم (2026-09-28): تنبيهات الرفض تصل Telegram فقط —
+            # بلا تسجيل في سجل الداشبورد (يثقله بلا فائدة).
+            print(f"  -> تحذير نصب: {res['display']}")
+            alerts.send(alerts.avoid_msg(res), dry_run, log_alert=False)
+            s["alerted"][key] = time.time()
+            sent += 1
+        elif res["signal"] == "WATCH" and wait_added < WAITLIST_ADD_PER_RUN:
+            # لائحة الانتظار: "شبه جاهزة" — تُعاد فحصها كل جولة لمدة 6 ساعات
+            wl = s.setdefault("waitlist", {})
+            if res["id"] not in wl and len(wl) < WAITLIST_MAX_SIZE:
+                wl[res["id"]] = {
+                    "chain": res["chain"], "pair": res["pair"],
+                    "display": res["display"], "score": res["score"],
+                    "added": time.time(), "checks": 0,
+                }
+                wait_added += 1
+                print(f"  -> لائحة الانتظار: {res['display']} ({res['score']})")
+    return results
+
+
+def check_waitlist(s, dry_run, ctx):
+    """إعادة فحص عملات لائحة الانتظار — من تحسّن يُرسل كتنبيه."""
+    wl = s.setdefault("waitlist", {})
+    if not wl:
+        return
+    print(f"=== إعادة فحص لائحة الانتظار ({len(wl)}) ===")
+    now = time.time()
+    # تصفية محلية أولاً (بلا I/O): المنتهية تُحذف فوراً
+    _todo = []
+    for wid in list(wl)[:25]:  # حد أقصى 25 إعادة فحص في الجولة (استنزاف API)
+        e = wl[wid]
+        if now - e["added"] > WAITLIST_MAX_AGE_H * 3600:
+
+            wl.pop(wid, None)
+            continue
+        _todo.append((wid, e))
+    # I/O متوازٍ: بيانات الزوج + فحص الأمان + الحيتان (كان متسلسلاً)
+    def _wl_one(item):
+        wid, e = item
+        p, _wl_src = clients.pair_chain(s, e["chain"], e["pair"])
+        if not p:
+            return (wid, e, None, None, None, None)
+        addr = (p.get("baseToken") or {}).get("address")
+        sec, sec_err = clients.token_security(e["chain"], addr) \
+            if addr else (None, None)
+        holders = (clients.solana_top10_pct(addr)
+                   if (e["chain"] == "solana" and addr) else None)
+        return (wid, e, p, addr, (sec, sec_err), holders)
+
+    for _r in clients.pmap(_wl_one, _todo, max_workers=8):
+        if not _r:
+            continue
+        wid, e, p, addr, _secpair, holders = _r
+        sec, sec_err = _secpair or (None, None)
+        if not p:
+            e["checks"] += 1
+            if e["checks"] >= 3:
+                wl.pop(wid, None)
+            continue
+        created = p.get("pairCreatedAt") or 0
+        if created and (now * 1000 - created) / 3_600_000 > NEW_ALERT_MAX_AGE_H:
+
+            wl.pop(wid, None)  # تجاوزت نافذة الفرص المبكرة
+            continue
+        # فحص السلامة: زوج بلا سعر = بيانات ناقصة — يُتجاهل
+        if not analyzer._f(p.get("priceUsd")):
+            _note_prefilter_reject(p, "REJECTED_NO_PRICE")
+
+            wl.pop(wid, None)
+            continue
+        # الافتراض الآمن: فشل فحص الأمان = مرفوضة
+        sec_failed = bool(addr) and sec is None
+        res = analyzer.analyze_pair(p, sec, holders=holders,
+                                    security_unknown=sec_failed,
+                                    security_error=sec_err
+                                    if sec_failed else None)
+        res["id"] = wid
+        res["kind"] = "dex"
+        res["chain"] = e["chain"]
+        res["pair"] = e["pair"]
+        res["mint"] = addr
+        # توثيق إعادة التقييم لطبقة البحث (لقطة فحص + تحديث n_seen) —
+        # قراءة فقط، لا تغيّر أي قرار
+        res["_pair"] = p
+        res["_sec"] = sec
+        try:
+            import research
+            research.note_reevaluation(res)
+        except Exception:
+            pass
+        if res["signal"] in ("BUY", "STRONG_BUY"):
+            bad, why = is_blacklisted(s, mint=addr, chain=e["chain"])
+            if bad:
+                print(f"  -> ⛔ محظورة (قائمة سوداء): {res['display']} — {why}")
+                wl.pop(wid, None)
+                continue
+            verdict = make_verdict(res, ctx)
+            print(f"  -> 🔄 تحسّنت: {res['display']} ({res['score']}) "
+                  f"نجاح~{verdict['prob']}%")
+            # عتبة الثقة: تبقى في المراقبة حتى تتجاوز الحد
+            if below_threshold(verdict):
+                _demote_to_watch(s, res, verdict)
+                continue
+            # التنبيه لا يُرسل إلا بعد فتح الصفقة (متابعة + وهمية) بنجاح
+            if not open_position(s, res, verdict):
+                wl.pop(wid, None)
+                continue
+            msg = ("🔄 <b>رجعت بقوة!</b> كانت تحت المراقبة والآن تحسّنت "
+                   "مؤشراتها.\n\n" + alerts.new_signal_msg(res, verdict))
+            alerts.send(msg, dry_run)
+            s["alerted"][f"sig:{wid}"] = now
+            s["stats"]["signals_today"] = s["stats"].get("signals_today", 0) + 1
+
+            wl.pop(wid, None)
+        elif res["signal"] == "AVOID":
+
+            wl.pop(wid, None)  # ساءت — أخرجها من اللائحة
+        else:
+            e["checks"] += 1
+            e["score"] = res["score"]
+
+
+def open_position(s, res, verdict=None):
+    """يفتح صفقة متابعة + صفقة وهمية — يرجع True فقط إذا نجح الاثنان.
+    الترتيب مقصود: لا تُفتح صفقة متابعة دون صفقة وهمية مطابقة، ولا يُرسل
+    تنبيه Telegram إلا بعد نجاح الفتح (ضمان ذري)."""
+    m = res["metrics"]
+    # السعر من المقاييس، وإلا من سعر الدخول المعلن في التنبيه
+    price = m.get("price") or (verdict or {}).get("entry")
+    if not price:
+        return False
+    if not paper_buy(s, res, verdict):
+        print(f"  -> تعذر فتح الصفقة الوهمية لـ {res['display']} "
+              f"(رصيد غير كافٍ) — لن يُرسل تنبيه")
+        return False
+    s["positions"][res["id"]] = {
+        "kind": res["kind"],
+        "name": res["display"],
+        "chain": res.get("chain"),
+        "pair": res.get("pair"),
+        "symbol": res.get("symbol"),
+        "mint": res.get("mint"),
+        "entry": price,
+        "entry_time": time.time(),
+        "tp_hit": [False] * len(TAKE_PROFITS),
+        "ref_liq": m.get("liq") or 0,
+        "warned": False,
+        "score": res.get("score"),
+        "band": (verdict or {}).get("band") or expert.band_of(res.get("score")),
+        "best_hit": None,
+        # نسخة الاستراتيجية عند الدخول — ذاكرة الخبير تُعلَّم كل نسخة
+        # على صفقاتها فقط (الطلب: v2 تُحاسَب على ماتشاتها هي)
+        "strat": STRATEGY_VERSION,
+    }
+    return True
+
+
+def paper_buy(s, res, verdict=None):
+    """شراء وهمي: يخصم من الرصيد الافتراضي ويفتح صفقة وهمية (بلا مخاطرة).
+    يرجع True عند نجاح الشراء، False عند تعذره (بلا رصيد/بلا سعر/موجودة)."""
+    if not PAPER_ENABLED:
+        return True
+    p = s["paper"]
+    m = res["metrics"]
+    price = m.get("price") or (verdict.get("entry") if verdict else None)
+    if not price:
+        return False
+    pid = res["id"]
+    if pid in p["positions"]:
+        return True  # الصفقة الوهمية موجودة أصلاً — الضمان محقق
+    # ---------- حزمة الحماية (2026-09-24) ----------
+    # 1) سقف الصفقات المفتوحة — لا شراء جديد والمحفظة ممتلئة
+    if len(p["positions"]) >= PAPER_MAX_OPEN:
+        print(f"  -> سقف الصفقات المفتوحة ({PAPER_MAX_OPEN}) ممتلئ — لا شراء")
+        return False
+    # 2) circuit breaker: إيقاف الشراء بعد سلسلة إغلاقات خاسرة
+    if time.time() < p.get("halt_until", 0):
+        print("  -> إيقاف مؤقت للشراء (circuit breaker) — لا شراء")
+        return False
+    # 3) تهدئة: منع إعادة الدخول في نفس العملة بعد إغلاق خاسر
+    cd = p.get("sl_cooldown") or {}
+    # تنظيف المدخلات المنتهية أولاً
+    now = time.time()
+    cd = {k: v for k, v in cd.items() if now - v < SL_COOLDOWN_H * 3600}
+    p["sl_cooldown"] = cd
+    if pid in cd:
+        print(f"  -> تهدئة بعد إغلاق خاسر لـ {res['display']} — لا شراء")
+        return False
+    # الرصيد النقدي هو المحدد الطبيعي الثاني بعد سقف الصفقات
+    amount = min(PAPER_RISK_PER_TRADE, p["cash"])
+    if amount < 5:
+        return False
+    # ---------- حارس السيولة (flow-3): فيتو ZeroMQ لحظي ----------
+    # يسأل محرك التدفق: هل الحيتان تبيع هذه العملة الآن؟
+    # DANGER_WHALE_DUMP = تخطي الدخول بصمت (داشبورد فقط، بلا تنبيه).
+    # غياب المحرك/البيانات/المهلة = لا فيتو أبداً — لا يمنع التداول.
+    flow_vetoed, flow_info = False, None
+    try:
+        flow_vetoed, flow_info = _flow_veto(res)
+    except Exception:
+        flow_vetoed, flow_info = False, None
+    if flow_vetoed:
+        try:
+            _fv = s.setdefault("flow_vetoes", [])
+            _fv.append({"sym": (flow_info or {}).get("sym"),
+                        "name": res.get("display"),
+                        "ts": time.time(),
+                        "cvd_5m": (flow_info or {}).get("cvd_5m"),
+                        "obi": (flow_info or {}).get("obi"),
+                        "z": (flow_info or {}).get("z")})
+            del _fv[:-50]
+        except Exception:
+            pass
+        print(f"  -> حارس السيولة: فيتو حيتان على {res['display']} — لا شراء")
+        return False
+    p["cash"] -= amount
+    # سعر التنفيذ الواقعي: الشراء بسعر أغلى بسبب الانزلاق السعري
+    eff_entry = price * (1 + PAPER_SLIPPAGE)
+    p["positions"][pid] = {
+        "kind": res["kind"],
+        "name": res["display"],
+        "chain": res.get("chain"),
+        "pair": res.get("pair"),
+        "symbol": res.get("symbol"),
+        "mint": res.get("mint"),
+        "entry": eff_entry,
+        "entry_time": time.time(),
+        "qty": amount / eff_entry,
+        "invested": amount,
+        "realized": 0.0,
+        "tp_hit": [False] * len(TAKE_PROFITS),
+        # توثيق معايير الدخول: تُحفظ في الأرشيف عند الإغلاق لقياس
+        # دقة الفلتر لاحقاً (هل الرابحون فعلاً أعلى نقاطاً؟)
+        "entry_score": res.get("score"),
+        "entry_prob": (verdict or {}).get("prob"),
+        # القياس البحثي (2026-09-25): مقاييس لحظة الدخول — قراءة فقط،
+        # تُحفظ في الأرشيف عند الإغلاق لقياس علاقتها بالنتائج
+        # (هل الرابحون أقل ATR؟ حجم متسارع؟ ضغط شراء أعلى؟)
+        "m_atr_pct": m.get("atr_pct"),
+        "m_vol_mult": m.get("vol_mult"),
+        "m_buy_pressure": m.get("buy_pressure"),
+        # سمات المعايرة (2026-09-25): معنويات/سيولة/قيمة/عمر لحظة الدخول
+        "entry_sent": (verdict or {}).get("news_sent"),
+        "entry_liq": m.get("liq"),
+        "entry_mcap": m.get("fdv"),
+        "entry_age_h": m.get("age_h"),
+        # حارس السيولة (flow-3): بصمة التدفق لحظة الدخول — للأرشيف
+        # والتحليل (هل الصفقات المرفوضة كانت ستنهار فعلاً؟)
+        "flow_cvd": (flow_info or {}).get("cvd_5m"),
+        "flow_obi": (flow_info or {}).get("obi"),
+        "flow_state": (flow_info or {}).get("state"),
+    }
+    p["trades"] += 1
+    print(f"  -> محفظة وهمية: شراء {res['display']} بـ ${amount:.2f} "
+          f"(تنفيذ: {eff_entry:.6g} بعد الانزلاق)")
+    return True
+
+
+def _archive_closed(p, pos, exit_price, pnl, reason, invested_override=None,
+                   partial=False):
+    """ينقل الصفقة المغلقة إلى الأرشيف مع كل تفاصيلها — لا تُحذف أبداً.
+    reason: TP1 (جني جزئي 50%) | BE (تعادل: خروج عند الدخول بعد الجني) |
+            TP (اكتمال الأهداف) | SL (وقف الخسارة) | RUG (انهيار) |
+            EXPIRED (انتهاء المدة) | DEAD (إشارات موت العملة المؤكدة).
+    invested_override: للجني الجزئي — تُحسب النسبة على الجزء المُباع فقط.
+    partial=True: حدث جزئي (جني TP1) — الداشبورد يعرضه لكنه يستثنيه من
+    مجاميع الربح ونسبة النجاح، لأن الإغلاق النهائي يحسب الربح الكلي
+    (متضمناً المحقق) في سجل واحد. بدون هذا يُحتسب ربح TP1 مرتين."""
+    inv = invested_override if invested_override else (pos.get("invested") or 0)
+    rec = {
+        "name": pos.get("name"),
+        "symbol": pos.get("symbol"),
+        "kind": pos.get("kind"),
+        "chain": pos.get("chain"),
+        "entry": pos.get("entry"),
+        "exit": exit_price,
+        "invested": round(inv, 2),
+        "pnl": round(pnl, 2),
+        "pnl_pct": round(pnl / inv * 100, 2) if inv else 0.0,
+        "reason": reason,
+        "partial": bool(partial),
+        "entry_time": pos.get("entry_time"),
+        "close_time": time.time(),
+        # معايير الدخول الموثقة — لتحليل دقة الفلتر في المراجعات القادمة
+        "entry_score": pos.get("entry_score"),
+        "entry_prob": pos.get("entry_prob"),
+        # القياس البحثي (2026-09-25): مقاييس لحظة الدخول — لتحليل علاقتها
+        # بالنتائج (هل الرابحون أقل ATR؟ حجم متسارع؟ ضغط شراء أعلى؟)
+        "m_atr_pct": pos.get("m_atr_pct"),
+        "m_vol_mult": pos.get("m_vol_mult"),
+        "m_buy_pressure": pos.get("m_buy_pressure"),
+        # سمات المعايرة (2026-09-25): معنويات/سيولة/قيمة/عمر — مدخلات
+        # نموذج المعايرة عند إعادة التدريب (نفس أسماء ML_FEATURES)
+        "sentiment": pos.get("entry_sent"),
+        "liq_usd": pos.get("entry_liq"),
+        "mcap_usd": pos.get("entry_mcap"),
+        "age_h": pos.get("entry_age_h"),
+        # حارس السيولة (flow-3): بصمة التدفق لحظة الدخول
+        "flow_cvd": pos.get("flow_cvd"),
+        "flow_obi": pos.get("flow_obi"),
+        "flow_state": pos.get("flow_state"),
+    }
+    arch = p.setdefault("closed_trades", [])
+    arch.append(rec)
+    # حد أقصى: أحدث 2000 صفقة — لمنع تضخم الـGist مع الزمن
+    if len(arch) > 2000:
+        del arch[:len(arch) - 2000]
+
+
+def _paper_close(p, pid, pos, eff_price, arch, s, dry_run):
+    """إغلاق كامل موحّد لصفقة وهمية — نقطة الخروج الوحيدة في الكود.
+    الترتيب ثابت دائماً: ردّ الكاش ← عدّاد الفوز/الخسارة ←
+    سلسلة الخسائر + تهدئة العملة + circuit-breaker ← الأرشفة (إجبارية).
+    هذا يمنع فجوة الأرشيف: مستحيل إغلاق صفقة دون أرشفتها، لأن كل
+    مسارات الإغلاق (SL/RUG/BE/EXPIRED) تمرّ من هنا إجبارياً.
+    يرجع (pnl, proceeds)."""
+    qty = pos.get("qty") or 0
+    entry = pos.get("entry") or 0
+    proceeds = qty * eff_price
+    pnl = proceeds - qty * entry + pos.get("realized", 0)
+    p["cash"] += proceeds
+    if pnl >= 0:
+        p["wins"] += 1
+        p["consec_sl"] = 0
+    else:
+        p["losses"] += 1
+        # سلسلة الخسائر المتتالية + تهدئة: منع إعادة الدخول في نفس العملة
+        p["consec_sl"] = p.get("consec_sl", 0) + 1
+        p.setdefault("sl_cooldown", {})[pid] = time.time()
+        # circuit breaker: إيقاف الشراء بعد N إغلاقات خاسرة متتالية
+        # (لا تمديد تلقائي أثناء الإيقاف — يُعاد التفعيل فقط بعد انتهائه)
+        if (p["consec_sl"] >= CIRCUIT_BREAKER_SL_STREAK
+                and time.time() >= p.get("halt_until", 0)):
+            p["halt_until"] = time.time() + CIRCUIT_BREAKER_HALT_H * 3600
+            print(f"  -> 🛑 circuit breaker: {p['consec_sl']} إغلاقات خاسرة "
+                  f"متتالية — إيقاف الشراء {CIRCUIT_BREAKER_HALT_H}h")
+            try:
+                alerts.send(alerts.circuit_breaker_msg(
+                    p["consec_sl"], CIRCUIT_BREAKER_HALT_H, p["cash"]), dry_run)
+            except Exception as e:
+                print(f"  -> تعذر إرسال تنبيه circuit breaker: {e}")
+    # الأرشفة إجبارية — لا إغلاق دون سجل
+    _archive_closed(p, pos, eff_price, pnl, arch)
+    return pnl, proceeds
+
+
+def _death_signals(pos, pair, now):
+    """إشارات موت العملة من بيانات DexScreener — تُرجع [(الاسم, الوصف)]
+    للإشارات *المؤكدة* فقط (استمرت DEATH_CONFIRM_MIN دقيقة).
+    لا تُطبَّق قبل DEATH_MIN_AGE_H ساعة من الدخول."""
+    if (now - pos["entry_time"]) / 3600 < DEATH_MIN_AGE_H:
+        return []
+    track = pos.setdefault("death", {})  # الاسم -> أول ظهور (timestamp)
+    cands = {}
+    try:
+        liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+    except (TypeError, ValueError):
+        liq = 0
+    # liq == 0 تعني "بيانات ناقصة" لا "سيولة صفر" — لا إشارة كاذبة
+    if liq > 0 and liq < DEATH_LIQ_USD:
+        cands["LIQ"] = f"السيولة ${liq:,.0f} < ${DEATH_LIQ_USD:,}"
+    vol = (pair.get("volume") or {}).get("m5")
+    try:
+        vol = float(vol) if vol is not None else None
+    except (TypeError, ValueError):
+        vol = None
+    if vol is not None and vol < DEATH_VOL_M5_USD:
+        cands["VOL"] = f"حجم 5د ${vol:,.0f} < ${DEATH_VOL_M5_USD:,}"
+    tx = (pair.get("txns") or {}).get("m5") or {}
+    try:
+        buys = int(tx.get("buys") or 0)
+        sells = int(tx.get("sells") or 0)
+    except (TypeError, ValueError):
+        buys, sells = 0, 0
+    if buys == 0 and sells >= DEATH_NOBUY_MIN_SELLS:
+        cands["NOBUY"] = f"صفر شراء / {sells} بيع في 5 دقائق"
+    confirmed = []
+    for name, desc in cands.items():
+        first = track.get(name)
+        if first is None:
+            track[name] = now  # بدء عدّاد التأكيد
+        elif now - first >= DEATH_CONFIRM_MIN * 60:
+            confirmed.append((name, desc))
+    # إشارة زالت → صفّر عدّادها (لا تُورَّث إيجابية كاذبة من الماضي)
+    for name in list(track):
+        if name not in cands:
+            del track[name]
+    return confirmed
+
+
+def _update_one_paper_position(s, p, pid, pos, closed, partials, dry_run,
+                               pre=None):
+    """متابعة صفقة وهمية واحدة — تُستدعى داخل try/except لكل صفقة.
+    pre: أسعار مسبقة الجلب {pid: (price, liq)} لتفادي طلبات متسلسلة."""
+    def _px():
+        if pre is not None and pid in pre:
+            return pre[pid]
+        return current_price(s, pos)
+
+    # انتهاء مدة المتابعة (time-stop): يُفحص أولاً — حتى لو تعذّر جلب
+    # السعر الحالي، الصفقة العتيقة تُغلق (بسعر الدخول) ولا تبقى عالقة للأبد
+    if time.time() - pos["entry_time"] > POSITION_MAX_AGE_H * 3600:
+        price_now, _liq = _px()
+        eff_price = (price_now * (1 - PAPER_SLIPPAGE)
+                     if price_now else pos["entry"])
+        pnl, _proceeds = _paper_close(p, pid, pos, eff_price, "EXPIRED",
+                                      s, dry_run)
+        closed.append(pid)
+        print(f"  -> وهمي: EXPIRED {pos['name']} (${pnl:+.2f})")
+        alerts.send(alerts.paper_closed_msg(
+            pos["name"], pnl,
+            pnl / pos["invested"] * 100 if pos["invested"] else 0,
+            f"⏱️ انتهاء المدة (time-stop: {POSITION_MAX_AGE_H} ساعة بلا هدف)",
+            p["cash"]),
+            dry_run)
+        return
+    price, _liq = _px()
+    if not price:
+        return
+    # لقطة سوقية للمخزن البحثي (مصدر "monitor") — قراءة فقط، بلا API
+    # إضافي (السعر والسيولة محمّلان أصلاً) ولا أثر على قرارات المتابعة
+    if market_store is not None:
+        _snapshot_position(pos, price, _liq)
+    entry = pos["entry"]
+    # v2: تتبع أعلى قمة — الوقف المتحرك لحقيبة القمر يتبعها
+    pos["peak"] = max(pos.get("peak") or entry, price)
+    # ترحيل: صفقات قديمة قبل تبسيط الأهداف (3 → 1)
+    th = pos.get("tp_hit") or []
+    pos["tp_hit"] = (th + [False] * len(TAKE_PROFITS))[:len(TAKE_PROFITS)]
+    if pos["tp_hit"][0] and not pos.get("be"):
+        pos["be"] = True  # وصلت الهدف سابقاً → وقفها الآن عند الدخول
+    # سعر التنفيذ الواقعي عند البيع (أرخص بسبب الانزلاق) — التفعيل يبقى
+    # على سعر السوق الخام، لكن التنفيذ الفعلي ينزلق
+    eff_price = price * (1 - PAPER_SLIPPAGE)
+    # ⏱️ فلتر الزخم (v2): بعد 48 ساعة بلا هدف وبلا زخم حقيقي (+30%) —
+    # الأطروحة ميتة: خروج مبكر بدل انتظار 7 أيام على عملة لا تتحرك
+    age_h = (time.time() - pos["entry_time"]) / 3600
+    if (age_h > MOMENTUM_CUTOFF_H and not (pos["tp_hit"] or [False])[0]
+            and price < entry * (1 + MOMENTUM_MIN_GAIN)):
+        pnl, _proceeds = _paper_close(p, pid, pos, eff_price, "TIME",
+                                      s, dry_run)
+        closed.append(pid)
+        print(f"  -> وهمي: ⏱️ زخم ميت {pos['name']} (${pnl:+.2f}) — "
+              f"{age_h:.0f}h بلا هدف")
+        alerts.send(alerts.paper_closed_msg(
+            pos["name"], pnl,
+            pnl / pos["invested"] * 100 if pos["invested"] else 0,
+            f"⏱️ زخم ميت: {age_h:.0f}h بلا هدف ولا +{MOMENTUM_MIN_GAIN * 100:.0f}%",
+            p["cash"]),
+            dry_run)
+        return
+    # نظام v2: 3 أهداف (+100%/+300%/+900% — بيع 25% عند كل هدف)
+    # والـ25% الأخيرة "حقيبة القمر" يتبعها وقف متحرك 30% تحت القمة
+    for i, tp in enumerate(TAKE_PROFITS):
+        if not pos["tp_hit"][i] and price >= entry * (1 + tp):
+            pos["tp_hit"][i] = True
+            frac = PAPER_SELL_FRACTIONS[i]
+            if frac >= 1.0 - 1e-9:
+                # بيع 100%: إغلاق نهائي فوري عبر المسار المركزي —
+                # يُحتسب فوزاً كاملاً (أرشيف + عدّادات + حماية)، ولا يبقى
+                # "هيكل" بكمية صفرية يشغل مكاناً في المحفظة حتى انتهاء المدة
+                pnl, _proceeds = _paper_close(p, pid, pos, eff_price,
+                                              f"TP{i + 1}", s, dry_run)
+                closed.append(pid)
+                print(f"  -> وهمي: 🎯 هدف +{tp * 100:.0f}% {pos['name']} "
+                      f"(${pnl:+.2f}) — خروج كامل")
+                alerts.send(alerts.paper_closed_msg(
+                    pos["name"], pnl,
+                    pnl / pos["invested"] * 100 if pos["invested"] else 0,
+                    f"🎯 الهدف +{tp * 100:.0f}%: خروج كامل", p["cash"]),
+                    dry_run)
+                break
+            sell_qty = pos["qty"] * frac
+            proceeds = sell_qty * eff_price
+            part_pnl = proceeds - sell_qty * entry
+            pos["qty"] -= sell_qty
+            pos["realized"] += part_pnl
+            pos["be"] = True  # 🛡️ الباقي أصبح خالي المخاطر (وقف متحرك يتبع القمة)
+            p["cash"] += proceeds
+            print(f"  -> وهمي: جني جزئي {frac*100:.0f}% {pos['name']} "
+                  f"(+${part_pnl:.2f} محقق) — وقف الخسارة → الدخول")
+            # أرشفة الجني الجزئي كحدث مستقل (partial: يُستثنى من مجاميع
+            # الربح/النجاح في الداشبورد — الإغلاق النهائي يحسب الكل)
+            _archive_closed(p, pos, eff_price, part_pnl, f"TP{i + 1}",
+                            invested_override=sell_qty * entry,
+                            partial=True)
+            partials.append(pid)
+            # جني جزئي حقيقي: نُعلن البيع الفعلي لا مجرد نصيحة
+            orig_qty = pos["invested"] / entry if entry else 0
+            remaining_pct = (pos["qty"] / orig_qty * 100
+                             if orig_qty else 0)
+            alerts.send(alerts.paper_tp_msg(
+                pos["name"], i, PAPER_SELL_FRACTIONS[i] * 100,
+                proceeds, pos["realized"], remaining_pct,
+                p["cash"]), dry_run)
+            break
+    if pid in closed:
+        return
+    # وقف الخسارة (v2): قبل أي جني -30%؛ بعد الجني الأول: max(الدخول،
+    # القمة × (1-30%)) — حقيبة القمر تؤمّن الربح تلقائياً بدل انتظار الانهيار.
+    # (خسارة ≥70% فجأة → "انهيار" Rug Pull بدل وقف الخسارة العادي)
+    if pos.get("be"):
+        stop = max(entry, (pos.get("peak") or entry) * (1 - TRAIL_PCT))
+    else:
+        stop = entry * (1 - STOP_LOSS)
+    if price <= stop:
+        loss = 1 - price / entry
+        rug = loss >= RUG_ALERT_LOSS
+        if rug and loss >= RUG_BLACKLIST_LOSS:
+            blacklist_rug(s, pos, loss)
+        if rug:
+            reason, arch = "🚨 انهيار مفاجئ (Rug Pull)", "RUG"
+        elif pos.get("be") and stop > entry * 1.005:
+            reason = "📈 وقف متحرك: ربح مؤمّن لحقيبة القمر"
+            arch = "TRAIL"
+        elif pos.get("be"):
+            reason, arch = "⚖️ تعادل: خروج عند سعر الدخول", "BE"
+        else:
+            reason, arch = "وقف الخسارة 🛑", "SL"
+        # الإغلاق المركزي: كاش + عدّادات + حماية + أرشفة (إجبارية)
+        pnl, _proceeds = _paper_close(p, pid, pos, eff_price, arch,
+                                      s, dry_run)
+        closed.append(pid)
+        print(f"  -> وهمي: {arch} {pos['name']} (${pnl:+.2f})")
+        alerts.send(alerts.paper_closed_msg(
+            pos["name"], pnl,
+            pnl / pos["invested"] * 100 if pos["invested"] else 0,
+            reason, p["cash"]), dry_run)
+        return
+    # 💀 إشارات موت العملة (صفقات DEX فقط — بيانات DexScreener مجانية):
+    # إشارتان مؤكدتان معاً = خروج كامل فوري. المستثمر يقطع الميتة رخيصة
+    # بدل انتظار وقف -30% أو انتهاء 7 أيام. إشارة واحدة = مراقبة فقط.
+    if pos.get("kind") == "dex":
+        try:
+            pair, _ds_src = clients.pair_chain(s, pos["chain"], pos["pair"])
+        except Exception:
+            pair = None
+        if pair:
+            sigs = _death_signals(pos, pair, time.time())
+            if len(sigs) >= 2:
+                desc = "، ".join(d for _, d in sigs)
+                dpnl, _dp = _paper_close(p, pid, pos, eff_price, "DEAD",
+                                         s, dry_run)
+                closed.append(pid)
+                print(f"  -> وهمي: 💀 موت {pos['name']} (${dpnl:+.2f}) "
+                      f"[{desc}]")
+                alerts.send(alerts.paper_closed_msg(
+                    pos["name"], dpnl,
+                    dpnl / pos["invested"] * 100 if pos["invested"] else 0,
+                    f"💀 إشارات موت العملة: {desc}", p["cash"]),
+                    dry_run)
+                return
+
+
+def update_paper(s, dry_run):
+    """يتابع الصفقات الوهمية: بيع جزئي عند الأهداف، بيع كامل عند وقف الخسارة."""
+    p = s["paper"]
+    if not p["positions"]:
+        return
+    print("=== المحفظة الافتراضية ===")
+    closed = []
+    partials = []
+    arch_before = len(p.get("closed_trades", []))
+    # I/O متوازٍ: أسعار الصفقات الوهمية مسبقاً (كانت متسلسلة داخل كل صفقة)
+    _items = list(p["positions"].items())
+    _pre = {}
+    for _r in clients.pmap(
+            lambda it: (it[0], current_price(s, it[1])),
+            _items, max_workers=6):
+        if _r:
+            _pre[_r[0]] = _r[1]
+    for pid, pos in _items:
+        # صفقة واحدة فاسدة يجب ألا تُسقط متابعة البقية
+        try:
+            _update_one_paper_position(s, p, pid, pos, closed, partials,
+                                       dry_run, pre=_pre)
+        except Exception as e:
+            print(f"  -> خطأ في متابعة {pos.get('name')}: {e} — تُترك مفتوحة")
+            continue
+    for pid in closed:
+        p["positions"].pop(pid, None)
+        # خط واحد: إغلاق الورقية يُسقط توأم المتابعة معها — كانت التوأمة
+        # تُترك يتيمة فتستمر تنبيهاتها (وقف/هدف/انتهاء) لصفقة خرجت منها
+        # المحفظة فعلاً. بلا هذا السطر، كل وقف خسارة ورقي كان يخلق
+        # "صفقة شبح" تُنبّه بلا رصيد خلفها حتى انتهاء 7 أيام.
+        s["positions"].pop(pid, None)
+    # حارس الأرشيف: كل إغلاق في هذا التشغيل يجب أن يقابله سجل —
+    # أي فجوة تُعلن فوراً بدل أن تُكتشف بعد أسابيع
+    arch_after = len(p.get("closed_trades", []))
+    expected = arch_before + len(closed) + len(partials)
+    if arch_after != expected:
+        msg = (f"⚠️ فجوة أرشيف في المحفظة الوهمية: أُغلقت {len(closed)} صفقة "
+               f"(+{len(partials)} جني جزئي) لكن الأرشيف زاد "
+               f"{arch_after - arch_before} فقط — راجع السجلات")
+        print("  -> " + msg)
+        alerts.send(msg, dry_run)
+
+
+def paper_summary(s):
+    """ملخص المحفظة الافتراضية للملخص اليومي."""
+    p = s["paper"]
+    invested = 0.0
+    for pos in p["positions"].values():
+        price, _liq = current_price(s, pos)
+        invested += (pos["qty"] * (price or pos["entry"]))
+    total = p["cash"] + invested
+    pnl = total - p["start"]
+    pct = pnl / p["start"] * 100 if p["start"] else 0
+    n_closed = p["wins"] + p["losses"]
+    winrate = p["wins"] / n_closed * 100 if n_closed else 0
+    return {
+        "total": total, "cash": p["cash"], "pnl": pnl, "pct": pct,
+        "open": len(p["positions"]), "closed": n_closed,
+        "wins": p["wins"], "winrate": winrate,
+    }
+
+
+def current_price(s, pos):
+    """السعر الحالي عبر سلسلة احتياطية: DexScreener → GeckoTerminal →
+    كاش مخزّن (طبقة ثالثة) → (لـ Solana) Jupiter.
+    إذا سقط مصدر → التالي يشتغل تلقائياً."""
+    try:
+        if pos["kind"] == "dex":
+            p, _src = clients.pair_chain(s, pos["chain"], pos["pair"])
+            if p:
+                if p.get("_stale"):
+                    print(f"  ⚠️ كاش احتياطي ({_src}) لسعر "
+                          f"{str(pos.get('pair') or '?')[:14]} — "
+                          f"المصدران الحيان ساقطان مؤقتاً")
+                return (float(p.get("priceUsd") or 0),
+                        float((p.get("liquidity") or {}).get("usd") or 0))
+            # الملاذ الأخير لعملات Solana: سعر Jupiter المباشر
+            if pos.get("chain") == "solana" and pos.get("mint"):
+                jp = clients.jupiter_price(pos["mint"])
+                if jp:
+                    return float(jp), 0
+            return None, None
+        t = clients.binance_ticker(pos["symbol"])
+        if not t:
+            return None, None
+        return float(t.get("lastPrice") or 0), 0
+    except Exception:
+        return None, None
+
+
+def update_positions(s, dry_run):
+    print("=== متابعة الصفقات المفتوحة ===")
+    closed = []
+    # I/O متوازٍ: أسعار الصفقات المفتوحة (كانت متسلسلة) — القرار يبقى متسلسلاً
+    _px = clients.pmap(
+        lambda it: (it[0], it[1], current_price(s, it[1])),
+        list(s["positions"].items()), max_workers=6)
+    for _r in _px:
+        if not _r:
+            continue
+        pid, pos, _pr = _r
+        price, liq = _pr or (None, None)
+        if not price:
+            continue
+        entry = pos["entry"]
+        # ترحيل: صفقات قديمة قبل تبسيط الأهداف (3 → 1)
+        th = pos.get("tp_hit") or []
+        pos["tp_hit"] = (th + [False] * len(TAKE_PROFITS))[:len(TAKE_PROFITS)]
+        if pos["tp_hit"][0] and not pos.get("be"):
+            pos["be"] = True
+        # نظام الاستثمار: تنبيه عند الأهداف + نقل وقف الخسارة لسعر الدخول
+        for i, tp in enumerate(TAKE_PROFITS):
+            if not pos["tp_hit"][i] and price >= entry * (1 + tp):
+                pos["tp_hit"][i] = True
+                pos["best_hit"] = f"tp{i + 1}"
+                pos["be"] = True  # 🛡️ الباقي أصبح خالي المخاطر (وقف متحرك يتبع القمة)
+                print(f"  -> تحقق الهدف: {pos['name']} — وقف الخسارة → الدخول")
+                alerts.send(alerts.tp_hit_msg(pos["name"], entry, price, i), dry_run)
+                break
+        if pid in closed:
+            continue
+        # وقف الخسارة — أو "انهيار مفاجئ" إن تجاوزت الخسارة 70% فجأة
+        # (يُرجح سحب سيولة، فيُسجل كنوع مستقل "rug" بدل "sl")
+        # v2: بعد الجني: max(الدخول، القمة×(1-30%)) — وقف متحرك بدل التعادل الثابت
+        pos["peak"] = max(pos.get("peak") or entry, price)
+        if pos.get("be"):
+            stop = max(entry, pos["peak"] * (1 - TRAIL_PCT))
+        else:
+            stop = entry * (1 - STOP_LOSS)
+        if price <= stop:
+            loss = 1 - price / entry
+            if loss >= RUG_ALERT_LOSS:
+                blacklisted = (blacklist_rug(s, pos, loss)
+                               if loss >= RUG_BLACKLIST_LOSS else False)
+                print(f"  -> 🚨 انهيار: {pos['name']} (-{loss * 100:.1f}%)")
+                alerts.send(alerts.rug_pull_msg(pos["name"], entry, price,
+                                                blacklisted), dry_run)
+                st.record_outcome(s, pos, "rug")
+            elif pos.get("be"):
+                if stop > entry * 1.005:
+                    print(f"  -> 📈 وقف متحرك: {pos['name']} (ربح مؤمّن)")
+                    alerts.send(
+                        f"📈 <b>وقف متحرك</b>: {pos['name']} — حقيبة القمر "
+                        f"أمّنت ربحها عند {price:.6g} (الدخول {entry:.6g})",
+                        dry_run)
+                    st.record_outcome(s, pos, "trail")
+                else:
+                    print(f"  -> ⚖️ تعادل: {pos['name']} (خروج عند الدخول)")
+                    alerts.send(alerts.be_stop_msg(pos["name"], entry), dry_run)
+                    st.record_outcome(s, pos, "tp1")  # الهدف تحقق والباقي خرج متعادلاً
+            else:
+                print(f"  -> وقف الخسارة: {pos['name']}")
+                alerts.send(alerts.stop_loss_msg(pos["name"], entry, price),
+                            dry_run)
+                st.record_outcome(s, pos, "sl")
+            closed.append(pid)
+            continue
+        # تحذير انهيار السيولة
+        if pos.get("ref_liq") and liq and liq < pos["ref_liq"] * 0.3 \
+                and not pos.get("warned"):
+            pos["warned"] = True
+            print(f"  -> تحذير سيولة: {pos['name']}")
+            alerts.send(alerts.rug_warn_msg(pos["name"], price), dry_run)
+        # إعادة تقييم الصفقة: هل المؤشرات ساءت من بعد الدخول؟
+        if (pos["kind"] == "dex" and not pos.get("deteriorated_warned")
+                and time.time() - pos["entry_time"] > POS_REEVAL_MIN_AGE_H * 3600):
+            pp, _rv_src = clients.pair_chain(s, pos["chain"], pos["pair"])
+            if pp:
+                rr = analyzer.analyze_pair(pp, None)
+                if rr["score"] < POS_REEVAL_MIN_SCORE:
+                    pos["deteriorated_warned"] = True
+                    print(f"  -> تحذير تدهور: {pos['name']} "
+                          f"({pos.get('score')} → {rr['score']})")
+                    alerts.send(alerts.pos_deteriorated_msg(
+                        pos["name"], entry, price,
+                        pos.get("score"), rr["score"]), dry_run)
+        # انتهاء مدة المتابعة (time-stop)
+        if time.time() - pos["entry_time"] > POSITION_MAX_AGE_H * 3600:
+            st.record_outcome(s, pos, pos.get("best_hit") or "expired")
+            closed.append(pid)
+    for pid in closed:
+        s["positions"].pop(pid, None)
+    print(f"صفقات مفتوحة: {len(s['positions'])}")
+
+
+def scan_watchlist(s, dry_run, ctx):
+    print("=== فحص عملات Binance ===")
+    movers = []
+    # I/O متوازٍ: سعر + شموع كل رمز (كان متسلسلاً: 20 طلباً)
+    def _wl_sym(sym):
+        t = clients.binance_ticker(sym)
+        k = clients.binance_klines(sym) if t else None
+        return (sym, t, k)
+
+    for _r in clients.pmap(_wl_sym, list(WATCHLIST), max_workers=10):
+        if not _r:
+            continue
+        sym, t, k = _r
+        if not t:
+            continue
+        try:
+            chg = float(t.get("priceChangePercent") or 0)
+        except (TypeError, ValueError):
+            continue
+        movers.append((sym.replace("USDT", ""), chg))
+        # كشف الضخ المفاجئ: حجم آخر ساعة مقابل متوسط الساعات السابقة
+        try:
+            vols = [float(x[5]) for x in k[-(VOL_SPIKE_LOOKBACK + 1):-1]
+                    if len(x) > 5]
+            last_v = float(k[-1][5]) if k and len(k[-1]) > 5 else 0
+            if vols and last_v > 0:
+                avg_v = sum(vols) / len(vols)
+                if avg_v > 0 and last_v >= VOL_SPIKE_MULT * avg_v:
+                    vkey = f"volspike:{sym}"
+                    wkey = f"watch:{sym}"
+                    now_t = time.time()
+                    if now_t - s["alerted"].get(vkey, 0) > VOL_SPIKE_COOLDOWN_H * 3600 \
+                            and now_t - s["alerted"].get(wkey, 0) > VOL_SPIKE_COOLDOWN_H * 3600:
+                        mult = last_v / avg_v
+                        print(f"  -> حركة غير عادية: {sym} (الحجم ×{mult:.1f})")
+                        alerts.send(alerts.unusual_volume_msg(
+                            sym.replace("USDT", ""), chg, mult), dry_run)
+                        s["alerted"][vkey] = now_t
+        except Exception:
+            pass
+        res = analyzer.analyze_binance(sym, t, k)
+        key = f"watch:{sym}"
+        if res["signal"] in ("BUY", "STRONG_BUY") \
+                and time.time() - s["alerted"].get(key, 0) > 12 * 3600:
+            res["id"] = f"binance:{sym}"
+            res["kind"] = "binance"
+            res["symbol"] = sym
+            bad, why = is_blacklisted(s, symbol=sym)
+            if bad:
+                print(f"  -> ⛔ محظورة (قائمة سوداء): {res['display']} — {why}")
+                continue
+            verdict = make_verdict(res, ctx)
+            # طبقة البحث (Phase 1): توثيق الاحتمال المحسوب فقط — لا يغيّر شيئاً
+            res["_verdict_prob"] = verdict.get("prob")
+            res["_verdict_sent"] = verdict.get("news_sent")
+            print(f"  -> إشارة {res['signal']}: {res['display']} "
+                  f"({res['score']}) نجاح~{verdict['prob']}%")
+            # بوابة الثقة (نفسها في كل المسارات): احتمال < 50% = مراقبة فقط
+            if below_threshold(verdict):
+                print(f"  -> ⏸ تحت عتبة الثقة ({verdict['prob']}% < {MIN_PROBABILITY}%): "
+                      f"{res.get('display')} — مراقبة فقط")
+                continue
+            # التنبيه لا يُرسل إلا بعد فتح الصفقة (متابعة + وهمية) بنجاح
+            if not open_position(s, res, verdict):
+                continue
+            alerts.send(alerts.new_signal_msg(res, verdict), dry_run)
+            s["alerted"][key] = time.time()
+            s["stats"]["signals_today"] = s["stats"].get("signals_today", 0) + 1
+    movers.sort(key=lambda x: abs(x[1]), reverse=True)
+    return movers
+
+
+def maybe_digest(s, dry_run, movers, ctx):
+    now = datetime.now(timezone.utc)
+    if now.hour not in DIGEST_HOURS_UTC:
+        return
+    # مفتاح الإرسال كقائمة: JSON يحفظ القوائم كما هي عبر الـGist، أما الـtuple
+    # فكان يتحول إلى list بعد الحفظ فيضيع التطابق ويُعاد إرسال الملخص كل
+    # 5 دقائق طوال ساعة الإرسال (تضخم Telegram وسجل التنبيهات بالتكرار)
+    sent_key = [now.strftime("%Y-%m-%d"), now.hour]
+    if s["stats"].get("digest_sent") == sent_key:
+        return
+    s["stats"]["digest_sent"] = sent_key
+    positions = []
+    for pid, pos in s["positions"].items():
+        price, _ = current_price(s, pos)
+        if price:
+            positions.append({"name": pos["name"], "entry": pos["entry"],
+                              "price": price})
+    nc = ctx.get("nc")
+    news_top = sorted(ctx.get("news", []),
+                      key=lambda x: abs(x.get("sentiment", 0)),
+                      reverse=True)[:6]
+    dctx = {
+        "macro": ctx.get("macro"),
+        "trending": ctx.get("trending"),
+        "news_top": news_top,
+        "track": st.track_summary(s),
+        "fng": ctx.get("fng"),
+        "news_stats": ctx.get("news_stats") or {},
+        "paper": paper_summary(s) if PAPER_ENABLED else None,
+        # حالة المزامنة (من آخر نشر متحقق): سطر واحد في الملخص يثبت أن
+        # التيليغرام والداشبورد والـVM على خط واحد
+        "sync": s.get("sync") or {},
+    }
+    date_str = now.strftime("%Y-%m-%d")
+    print("=== إرسال الملخص اليومي ===")
+    # الملخص الدوري: Telegram فقط — لا يُسجل في سجل تنبيهات الداشبورد
+    # (قرار المستخدم 2026-09-23: التقرير يصل Telegram فقط، بمحتواه
+    # الكامل كما كان — ربح/خسارة المحفظة الوهمية — والأرقام من نفس
+    # الـstate الذي يقرأه الداشبورد فتبقى متطابقة)
+    alerts.send(alerts.digest_msg(date_str, positions,
+                                  s["stats"].get("signals_today", 0),
+                                  movers, dctx), dry_run, log_alert=False)
+
+
+def _sos_alert(error):
+    """تنبيه الطوارئ: قبل الانهيار، نخبر المستخدم أن النظام توقف —
+    حتى لا يعيش في وهم أن 'السوق هادئ' بينما البوت معطل."""
+    try:
+        alerts.send(
+            "🚨 <b>توقف النظام عن العمل بسبب خطأ تقني</b>\n"
+            f"السبب: {html.escape(str(error)[:300])}\n"
+            "يرجى مراجعة سجلات GitHub Actions فوراً.", dry_run=False)
+    except Exception as e:
+        print("SOS failed:", e)
+
+
+def _scan_timeout_handler(signum, frame):
+    """يُقاطع الفحص المعلّق بعد 120 ثانية — يحرّر القفل للفحص التالي."""
+    raise TimeoutError("انتهت مهلة الفحص (120 ثانية)")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true",
+                    help="طباعة الرسائل بدل إرسالها وعدم حفظ الحالة")
+    ap.add_argument("--monitor", action="store_true",
+                    help="المراقب الخفيف: متابعة الصفقات المفتوحة فقط "
+                         "(أسعار + خروج) بلا اكتشاف/شراء/ملخصات")
+    a = ap.parse_args()
+
+    # حد دفاعي 120 ثانية ضد التجمّد: يُجهَض الفحص المعلّق ويُحرَّر القفل
+    # تلقائياً — الفحص التالي (بعد دقيقة) يبدأ نظيفاً بدل 30 دقيقة توقف.
+    signal.signal(signal.SIGALRM, _scan_timeout_handler)
+    signal.alarm(120)
+    try:
+        _run(a)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[!] انهيار غير متوقع: {e}")
+        if not a.dry_run:
+            _sos_alert(e)
+        raise  # يفشل الـworkflow بعلامة حمراء — وضوح كامل
+    finally:
+        signal.alarm(0)
+
+
+def _plain(text):
+    """نص التنبيه بصيغة بسيطة للداشبورد (إزالة وسوم HTML الخاصة بـTelegram)."""
+    t = re.sub(r"<[^>]+>", "", text or "")
+    return html.unescape(" ".join(t.split()))
+
+
+def _log_alert(s, kind, text):
+    """سجل التنبيهات في الحالة — الداشبورد يعرضه عبر الـGist.
+    هكذا 'ينصت' الداشبورد لكل تنبيه يرسله البوت دون قراءة Telegram."""
+    log = s.setdefault("alert_log", [])
+    log.append({"t": time.time(), "kind": kind or "info",
+                "text": _plain(text)[:300]})
+    # حد أقصى: أحدث 40 تنبيهاً — لمنع تضخم الـGist
+    if len(log) > 40:
+        del log[:len(log) - 40]
+
+
+def _sync_publish(s, dry_run):
+    """نشر متزامن واحد: VM → الـGist (الداشبورد) مع تحقق فعلي من الوصول،
+    وتصريف طابور Telegram الدائم — الثلاثة على خط واحد دائماً.
+    يُحدّث s['sync'] فيرى الداشبورد (سطر المزامنة) والتيليغرام (الملخص)
+    نفس حالة الـVM. عند تعذّر التأكيد: SOS عبر Telegram (قناة مستقلة
+    عن الداشبورد) ثم إعادة محاولة تلقائية في الفحص القادم."""
+    if dry_run:
+        return
+    before = st.gist_updated_at()
+    st.save(s)
+    ok = st.verify_gist_changed(before)
+    if not ok:
+        time.sleep(3)
+        st.save(s)
+        ok = st.verify_gist_changed(before)
+    s["sync"] = {
+        "gist_ok": bool(ok),
+        "gist_checked_at": time.time(),
+        "tg_pending": len(s.get("tg_pending") or []),
+    }
+    if not ok:
+        # SOS عبر Telegram فقط (log_alert=False): الداشبورد نفسه هو
+        # المعطوب فلا فائدة من تلويث سجله، والتيليغرام قناة مستقلة
+        alerts.send(
+            "⚠️ <b>تنبيه مزامنة:</b> تعذّر تأكيد وصول الحالة إلى الداشبورد — "
+            "قد ترى أرقاماً متأخرة مؤقتاً. سأعيد المحاولة تلقائياً "
+            "في الفحص القادم.",
+            dry_run, log_alert=False)
+    st.save(s)
+
+
+def ensure_commander():
+    """يضمن أن مستمع أوامر Telegram يعمل — يُستدعى في بداية كل فحص.
+
+    النشر بلا SSH: الـVM يسحب الكود تلقائياً كل تشغيل، وأول فحص بعد
+    وصول commander.py يُقلعه كعملية منفصلة دائمة (start_new_session).
+    ملف pid يمنع التكرار."""
+    try:
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+        bot_dir = os.path.dirname(repo_dir)
+        cmd_path = os.path.join(repo_dir, "commander.py")
+        if not os.path.exists(cmd_path):
+            return
+        pid_file = os.path.join(bot_dir, "commander.pid")
+        alive = False
+        try:
+            with open(pid_file) as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            alive = True
+        except Exception:
+            alive = False
+        if alive:
+            return
+        log = open(os.path.join(bot_dir, "commander.log"), "a")
+        subprocess.Popen([sys.executable, cmd_path],
+                         start_new_session=True,
+                         stdout=log, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL)
+        print("  -> commander started")
+    except Exception as e:
+        print("  -> ensure_commander failed:", e)
+
+
+def _run(a):
+    # وضع التجربة: بلا قفل وبلا مستمع أوامر
+    if a.dry_run:
+        (_monitor if a.monitor else _scan)(a)
+        return
+    if a.monitor:
+        # المراقب الخفيف (كل دقيقة): نفس القفل المشترك لمنع سباق الكتابة
+        # مع السكانر/الأوامر، لكن بلا إقلاع commander (الفحص الكامل يتكفل
+        # به كل دقيقتين) وبلا اكتشاف/شراء/ملخصات.
+        with state_locked():
+            _monitor(a)
+        return
+    ensure_commander()
+    # القفل المشترك مع مستمع الأوامر: الفحص كاملاً عملية ذرية واحدة —
+    # أي أمر /sell أو /halt أثناء الفحص ينتظر دوره بدل سباق الكتابة
+    with state_locked():
+        _scan(a)
+
+
+def _scan(a):
+    s = st.load()
+    # قناة أوامر Brother (صندوق البريد): تُنفَّذ مرة واحدة فقط لكل أمر،
+    # والنتيجة تُحفظ مع الحالة → تظهر في الـGist. تُتخطى في وضع التجربة
+    # حتى لا يُنفَّذ الأمر دون تسجيل last_id فيُعاد تنفيذه لاحقاً.
+    if not a.dry_run and OPS_INBOX_ENABLED:
+        try:
+            import ops_agent
+            if ops_agent.process_inbox(s):
+                print("[ops] نُفِّذ أمر من صندوق البريد.")
+        except Exception as e:
+            print("[ops] خطأ في صندوق البريد:", e)
+    # الداشبورد ينصت: كل alerts.send يُسجل في الحالة → يُعرض في الداشبورد
+    alerts.LOG_HOOK = lambda kind, text: _log_alert(s, kind, text)
+    # الطابور الدائم: الرسائل الفاشلة تنجو من موت العملية (كل فحص عملية
+    # جديدة) — فيبقى Telegram والداشبورد والـVM على خط واحد
+    alerts.PENDING_HOOK = lambda: s.setdefault("tg_pending", [])
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if s["stats"].get("day") != today:
+        s["stats"] = {"day": today, "signals_today": 0}
+
+    ctx = build_context(s)
+    results = scan_new_coins(s, a.dry_run, ctx)
+    # لقطات سوقية للعملات المقيّمة — وقود الباكتست والمعايرة
+    # (قراءة فقط: تُسجَّل بعد التقييم، ولا تغيّر أي قرار)
+    if market_store is not None:
+        _snapshot_results(results)
+    # طبقة جمع بيانات البحث (Phase 1): تسجيل كل فرصة + تتبع أسعارها —
+    # قراءة فقط، لا تغيّر أي قرار ولا أي عتبة في v2 (fail-safe بالكامل)
+    try:
+        import research
+        research.run_collection(results)
+    except Exception as e:
+        print("research skipped:", e)
+    check_waitlist(s, a.dry_run, ctx)
+    update_positions(s, a.dry_run)
+    movers = scan_watchlist(s, a.dry_run, ctx)
+    update_paper(s, a.dry_run)
+    maybe_digest(s, a.dry_run, movers, ctx)
+
+    if not a.dry_run:
+        _sync_publish(s, a.dry_run)
+    print("تم.")
+
+
+def _monitor(a):
+    """المراقب الخفيف للصفقات المفتوحة — يُشغَّل كل دقيقة عبر cron.
+
+    يستعمل نفس دوال المتابعة بالضبط المستعملة في الفحص الكامل
+    (update_positions للصفقات المتابعة + update_paper للمحفظة الوهمية) —
+    نفس القواعد (v2): 3 أهداف (+100%/+300%/+900% — بيع 25% لكل هدف)
+    + حقيبة قمر 25% بوقف متحرك 30%، وقف الخسارة -30%، فلتر الزخم 48h،
+    الانهيار، وانتهاء المدة 7 أيام — لكن بلا build_context الثقيل وبلا اكتشاف عملات جديدة
+    وبلا شراء وبلا ملخصات. النتيجة: دقة الخروج ~دقيقة بدل ~دقيقتين،
+    بتكلفة بضعة طلبات API فقط (سعر كل صفقة مفتوحة)."""
+    s = st.load()
+    # الداشبورد ينصت: كل alerts.send يُسجل في الحالة → يُعرض في الداشبورد
+    alerts.LOG_HOOK = lambda kind, text: _log_alert(s, kind, text)
+    # الطابور الدائم: الرسائل الفاشلة تنجو من موت العملية
+    alerts.PENDING_HOOK = lambda: s.setdefault("tg_pending", [])
+    update_positions(s, a.dry_run)
+    update_paper(s, a.dry_run)
+    # موارد الخادم للوحة "موارد الخادم" — قراءة فقط من /proc، بلا مكتبات
+    if vm_resources is not None:
+        try:
+            vm_resources.update_state(s)
+        except Exception as _e:
+            print("resources skipped:", _e)
+    # حالة عاملي heavy-2 (البث المباشر + مختبر الأبحاث) للداشبورد
+    try:
+        _read_daemon_status(s)
+    except Exception as _e:
+        print("daemon status skipped:", _e)
+    if not a.dry_run:
+        _sync_publish(s, a.dry_run)
+    print("تم (مراقب).")
+
+
+if __name__ == "__main__":
+    main()
