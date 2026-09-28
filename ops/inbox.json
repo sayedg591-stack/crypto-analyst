@@ -1,6 +1,6 @@
 {
-  "id": "trapfix-20260928-0826",
-  "cmd": "sed -i 's/-gt 12/-gt 6/' /home/ubuntu/bot/freeze-watch.sh && echo THRESHOLD_FIXED && grep -c 'gt 6' /home/ubuntu/bot/freeze-watch.sh",
+  "id": "readcapture-20260928-0907",
+  "cmd": "ls -lh /home/ubuntu/bot/freeze-capture.log 2>&1 && echo '===CAPTURE-LOG===' && head -120 /home/ubuntu/bot/freeze-capture.log 2>&1",
   "timeout": 30,
-  "note": "fix trap threshold 12->6 min (watchdog reboots at 10)"
+  "note": "read freeze-capture trap log"
 }
