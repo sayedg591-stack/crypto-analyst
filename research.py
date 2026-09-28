@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""طبقة جمع بيانات البحث — Full Opportunity Dataset (Phase 1).
+"""طبقة جمع بيانات البحث — Full Opportunity Dataset (Phase 1 + تصحيحات).
 
 الهدف: تسجيل كل عملة يراها الـscanner (وليس فقط التي اجتازت الفلاتر)
 مع كل الـfeatures وقت التقييم، ثم تتبع سعرها لاحقاً حتى للعملات
@@ -16,15 +16,26 @@
   يحدّث n_seen و last_seen_ts فقط.
 
 الجداول:
-- scan_opportunities: كل فرصة + features وقت أول مشاهدة.
-- price_observations: سلسلة سعرية لكل فرصة (كل ~دقيقتين عبر الـscan).
+- scan_opportunities: كل فرصة + features وقت أول مشاهدة —
+  تشمل رفضات الـprefilter (signal='PREFILTER', decision='REJECTED_*').
+- scan_events: لقطة ثابتة لكل فحص لكل فرصة مقيَّمة (immutable —
+  وقود الـreplay في Phase 2). رفضات الـprefilter لا تُسجَّل هنا:
+  featuresها ثابتة وقرارها حتمي من العتبات، وصف الفرصة
+  (n_seen/last_seen) يكفي لتتبع ظهورها.
+- price_observations: سلسلة سعرية للفرص المقيَّمة (كل ~دقيقتين).
 - opportunity_outcomes: ملخص محسوب (MFE/MAE، الأسعار عند الآفاق،
-  hit_100/300/900) — يُعاد حسابه مع كل دفعة ملاحظات.
+  hit_100/300/900) — يُعاد حسابه مع كل دفعة ملاحظات، ويُغلق قسراً
+  عند انتهاء نافذة 25h عبر finalize_due.
+
+التتبع العادل: أولوية لمن طال انتظار ملاحظته (بلا تجويع للقديمة)،
+مع فاصل 90s بين ملاحظتين لنفس الفرصة لتوزيع حمل الـAPI.
 
 ملاحظة صدق: CVD/OBI/volatility_z من محرك flow.py تغطي رموز Binance
 فقط، بينما الـscanner يقيّم أزواج DEX — لذلك ستكون هذه الأعمدة NULL
 في الغالب. الأعمدة موجودة للتوافق المستقبلي، وعدم الاستعلام عنها
-في مسار الفحص قرار متعمد (تجنب إبطاء الـscan).
+في مسار الفحص قرار متعمد (تجنب إبطاء الـscan). وبالمثل: رفضات
+الـprefilter تُسجَّل بلا score/probability (NULL صادق — لم تُقيَّم).
+تتبع أسعار رفضات الـprefilter مؤجَّل لـPhase 1 (ميزانية API).
 """
 import os
 import time
@@ -42,6 +53,19 @@ HORIZONS = [
 TRACK_TTL_S = 25 * 3600      # نافذة التتبع: 25 ساعة ثم تُغلق الفرصة
 TRACK_CAP = 150              # أقصى فرص مفتوحة تُتبع في كل جولة
 STALE_AFTER_S = 2 * 3600     # بلا ملاحظات لأكثر من ساعتين = stale
+TRACK_STAGGER_S = 90         # أقل فاصل بين ملاحظتين لنفس الفرصة
+
+# أسباب الرفض المبكر (قبل التحليل) — تُسجَّل كلها، بلا استثناء
+REJECT_REASONS = (
+    "REJECTED_LIQUIDITY",
+    "REJECTED_VOLUME",
+    "REJECTED_TXNS",
+    "REJECTED_AGE",
+    "REJECTED_SYMBOL",
+    "REJECTED_NO_PRICE",
+    "REJECTED_BLACKLIST",
+    "REJECTED_ERROR",
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scan_opportunities (
@@ -86,6 +110,23 @@ CREATE TABLE IF NOT EXISTS scan_opportunities (
     decision TEXT,
     avoid_reason TEXT
 );
+CREATE TABLE IF NOT EXISTS scan_events (
+    scan_ts DOUBLE,
+    opportunity_id TEXT,
+    decision TEXT,
+    signal TEXT,
+    score INTEGER,
+    probability INTEGER,
+    price DOUBLE,
+    liquidity DOUBLE,
+    volume_h24 DOUBLE,
+    pc_h1 DOUBLE,
+    pc_h24 DOUBLE,
+    age_h DOUBLE,
+    n_seen INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_events_opp_ts
+    ON scan_events (opportunity_id, scan_ts);
 CREATE TABLE IF NOT EXISTS price_observations (
     opportunity_id TEXT,
     ts DOUBLE,
@@ -148,6 +189,12 @@ def _i(v, default=None):
 
 def _opp_id(chain, pair_address):
     return f"{(chain or '?').lower()}:{(pair_address or '').lower()}"
+
+
+def _decision_of(res):
+    sig = res.get("signal") or "UNKNOWN"
+    return ("BUY" if sig in ("BUY", "STRONG_BUY")
+            else "AVOID" if sig == "AVOID" else "WATCH")
 
 
 def _avoid_reason(res):
@@ -216,8 +263,7 @@ class ResearchStore:
             if not (price and price > 0):
                 return None
             sig = res.get("signal") or "UNKNOWN"
-            decision = ("BUY" if sig in ("BUY", "STRONG_BUY")
-                        else "AVOID" if sig == "AVOID" else "WATCH")
+            decision = _decision_of(res)
             row = {
                 "opportunity_id": oid,
                 "first_seen_ts": now,
@@ -294,6 +340,106 @@ class ResearchStore:
             print(f"[research] record_opportunity skipped: {e}")
             return None
 
+    def record_prefilter_reject(self, p, reason):
+        """يسجل عملة رُفضت قبل التحليل (عتبات مبكرة/رمز/قائمة سوداء...).
+        صف واحد لكل زوج: التكرار يحدّث n_seen/last_seen فقط.
+        لا يمس قرار فرصة مقيَّمة سابقاً (التقييم أبقى من الرفض).
+        لا تُفتح لها ملاحظات سعرية ولا نتيجة — تسجيل فقط (قرار Phase 1:
+        ميزانية الـAPI للمقيَّمة). لا يرفع أبداً."""
+        try:
+            con = self._connect()
+            if con is None or not isinstance(p, dict):
+                return None
+            if reason not in REJECT_REASONS:
+                reason = "REJECTED_ERROR"
+            chain = p.get("chainId")
+            pair_addr = p.get("pairAddress")
+            if not pair_addr:
+                return None
+            oid = _opp_id(chain, pair_addr)
+            now = time.time()
+            base = p.get("baseToken") or {}
+            price = _f(p.get("priceUsd"))  # قد يكون NULL — صدق البيانات
+            liq = _f((p.get("liquidity") or {}).get("usd"))
+            vol24 = _f((p.get("volume") or {}).get("h24"))
+            age_h = None
+            try:
+                created = p.get("pairCreatedAt") or 0
+                if created:
+                    age_h = round((now * 1000 - created) / 3600000, 2)
+            except Exception:
+                pass
+            exists = con.execute(
+                "SELECT n_seen, signal FROM scan_opportunities "
+                "WHERE opportunity_id = ?", [oid]).fetchone()
+            if exists:
+                _n_seen, sig = exists
+                if sig == "PREFILTER":
+                    con.execute(
+                        """UPDATE scan_opportunities SET last_seen_ts = ?,
+                           n_seen = n_seen + 1, price = ?, liquidity = ?,
+                           volume_h24 = ?, age_h = ?, decision = ?,
+                           avoid_reason = ?
+                           WHERE opportunity_id = ?""",
+                        [now, price, liq, vol24, age_h, reason, reason, oid])
+                else:
+                    # مقيَّمة سابقاً: نحدّث المشاهدة فقط — القرار يبقى.
+                    con.execute(
+                        """UPDATE scan_opportunities SET last_seen_ts = ?,
+                           n_seen = n_seen + 1
+                           WHERE opportunity_id = ?""",
+                        [now, oid])
+            else:
+                con.execute(
+                    """INSERT INTO scan_opportunities
+                       (opportunity_id, first_seen_ts, last_seen_ts, n_seen,
+                        chain, token_address, pair_address, symbol, price,
+                        liquidity, volume_h24, age_h, signal, decision,
+                        avoid_reason)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    [oid, now, now, 1, chain, base.get("address"), pair_addr,
+                     base.get("symbol"), price, liq, vol24, age_h,
+                     "PREFILTER", reason, reason])
+            return oid
+        except Exception as e:
+            print(f"[research] record_prefilter_reject skipped: {e}")
+            return None
+
+    def record_scan_event(self, res, scan_ts):
+        """لقطة ثابتة لفرصة مقيَّمة في فحص واحد — تُدرَج ولا تُحدَّث أبداً.
+        وقود الـreplay في Phase 2. لا يرفع أبداً."""
+        try:
+            con = self._connect()
+            if con is None:
+                return False
+            chain = res.get("chain")
+            pair_addr = res.get("pair")
+            oid = _opp_id(chain, pair_addr)
+            if not pair_addr:
+                return False
+            p = res.get("_pair") or {}
+            m = res.get("metrics") or {}
+            pc = p.get("priceChange") or {}
+            n_seen = con.execute(
+                "SELECT n_seen FROM scan_opportunities "
+                "WHERE opportunity_id = ?", [oid]).fetchone()
+            con.execute(
+                "INSERT INTO scan_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [float(scan_ts), oid, _decision_of(res),
+                 res.get("signal"), _i(res.get("score")),
+                 _i(res.get("_verdict_prob")),
+                 _f(p.get("priceUsd")) or _f(m.get("price")),
+                 _f((p.get("liquidity") or {}).get("usd")),
+                 _f((p.get("volume") or {}).get("h24")) or _f(m.get("vol24")),
+                 _f(pc.get("h1")) or _f(m.get("pc1h")),
+                 _f(pc.get("h24")) or _f(m.get("pc24h")),
+                 _f(m.get("age_h")),
+                 n_seen[0] if n_seen else 1])
+            return True
+        except Exception as e:
+            print(f"[research] record_scan_event skipped: {e}")
+            return False
+
     # ---------- الملاحظات السعرية ----------
     def record_observation(self, opportunity_id, ts, elapsed_s, price_usd,
                            liq_usd=None, vol_m5_usd=None, source="track"):
@@ -311,23 +457,33 @@ class ResearchStore:
             return False
 
     def open_opportunities(self, limit=TRACK_CAP):
-        """الفرص المفتوحة للتتبع: عمرها < 25h وحالتها tracking."""
+        """الفرص المفتوحة للتتبع — جدولة عادلة: الأقدم بلا ملاحظة أولاً
+        (لا تجويع للقديمة عند تجاوز السقف)، مع فاصل TRACK_STAGGER_S بين
+        الملاحظات لتوزيع حمل الـAPI. تُستبعد رفضات الـprefilter."""
         try:
             con = self._connect()
             if con is None:
                 return []
-            cutoff = time.time() - TRACK_TTL_S
+            now = time.time()
+            cutoff = now - TRACK_TTL_S
+            due = now - TRACK_STAGGER_S
             rows = con.execute(
                 """SELECT o.opportunity_id, o.chain, o.pair_address,
-                          o.first_seen_ts
+                          o.first_seen_ts, MAX(po.ts) AS last_obs
                    FROM scan_opportunities o
                    LEFT JOIN opportunity_outcomes oc
                      ON o.opportunity_id = oc.opportunity_id
+                   LEFT JOIN price_observations po
+                     ON o.opportunity_id = po.opportunity_id
                    WHERE o.first_seen_ts >= ?
+                     AND o.signal != 'PREFILTER'
                      AND (oc.status IS NULL OR oc.status = 'tracking')
-                   ORDER BY o.first_seen_ts DESC
+                   GROUP BY o.opportunity_id, o.chain, o.pair_address,
+                            o.first_seen_ts
+                   HAVING MAX(po.ts) IS NULL OR MAX(po.ts) < ?
+                   ORDER BY last_obs ASC NULLS FIRST
                    LIMIT ?""",
-                [cutoff, int(limit)]).fetchall()
+                [cutoff, due, int(limit)]).fetchall()
             return [{"opportunity_id": r[0], "chain": r[1],
                      "pair": r[2], "first_seen_ts": r[3]} for r in rows]
         except Exception as e:
@@ -350,8 +506,10 @@ class ResearchStore:
 
     # ---------- حساب النتائج ----------
     @staticmethod
-    def compute_outcome(ref_price, obs):
-        """يحسب ملخص الفرصة من الملاحظات. خالص وقابل للاختبار."""
+    def compute_outcome(ref_price, obs, force_close=False):
+        """يحسب ملخص الفرصة من الملاحظات. خالص وقابل للاختبار.
+        force_close: إغلاق قسري عند انتهاء نافذة 25h — ما لدينا هو
+        كل ما سنحصل عليه."""
         out = {"ref_price": ref_price, "n_obs": len(obs),
                "status": "tracking"}
         for _, col in HORIZONS:
@@ -362,10 +520,14 @@ class ResearchStore:
                     "ret_24h_pct": None,
                     "hit_100": 0, "hit_300": 0, "hit_900": 0})
         if not ref_price or ref_price <= 0 or not obs:
+            if force_close:
+                out["status"] = "stale"
             return out
         pts = [(o["elapsed_s"], o["price"]) for o in obs
                if o.get("price") and o["price"] > 0]
         if not pts:
+            if force_close:
+                out["status"] = "stale"
             return out
         pts.sort()
         # أقرب ملاحظة لكل أفق (بتسامح ±50% من الأفق)
@@ -395,9 +557,12 @@ class ResearchStore:
         elif max_elapsed >= STALE_AFTER_S and \
                 (time.time() - obs[-1]["ts"]) >= STALE_AFTER_S:
             out["status"] = "stale"
+        if force_close and out["status"] == "tracking":
+            out["status"] = "complete" if out["n_obs"] > 1 else "stale"
         return out
 
-    def _upsert_outcome(self, opportunity_id, ref_price=None):
+    def _upsert_outcome(self, opportunity_id, ref_price=None,
+                        force_close=False):
         try:
             con = self._connect()
             if con is None:
@@ -408,7 +573,8 @@ class ResearchStore:
                     "WHERE opportunity_id = ?", [opportunity_id]).fetchone()
                 ref_price = r[0] if r else None
             obs = self.observations(opportunity_id)
-            out = self.compute_outcome(ref_price, obs)
+            out = self.compute_outcome(ref_price, obs,
+                                       force_close=force_close)
             out["opportunity_id"] = opportunity_id
             out["updated_ts"] = time.time()
             cols = ["opportunity_id", "ref_price", "n_obs"] + \
@@ -434,6 +600,34 @@ class ResearchStore:
         except Exception as e:
             print(f"[research] refresh_outcome skipped: {e}")
 
+    def finalize_due(self):
+        """إغلاق الفرص التي تجاوزت نافذة 25h — حساب نهائي من الملاحظات
+        الموجودة حتى لو لم تصل ملاحظة عند 24h بالضبط. لا يرفع أبداً."""
+        try:
+            con = self._connect()
+            if con is None:
+                return 0
+            cutoff = time.time() - TRACK_TTL_S
+            rows = con.execute(
+                """SELECT o.opportunity_id FROM scan_opportunities o
+                   LEFT JOIN opportunity_outcomes oc
+                     ON o.opportunity_id = oc.opportunity_id
+                   WHERE o.first_seen_ts < ?
+                     AND o.signal != 'PREFILTER'
+                     AND (oc.status IS NULL OR oc.status = 'tracking')""",
+                [cutoff]).fetchall()
+            n = 0
+            for (oid,) in rows:
+                try:
+                    self._upsert_outcome(oid, force_close=True)
+                    n += 1
+                except Exception:
+                    continue
+            return n
+        except Exception as e:
+            print(f"[research] finalize_due skipped: {e}")
+            return 0
+
     # ---------- إحصاءات ----------
     def counts(self):
         try:
@@ -442,12 +636,14 @@ class ResearchStore:
                 return {}
             n_opp = con.execute(
                 "SELECT COUNT(*) FROM scan_opportunities").fetchone()[0]
+            n_ev = con.execute(
+                "SELECT COUNT(*) FROM scan_events").fetchone()[0]
             n_obs = con.execute(
                 "SELECT COUNT(*) FROM price_observations").fetchone()[0]
             n_out = con.execute(
                 "SELECT COUNT(*) FROM opportunity_outcomes").fetchone()[0]
-            return {"opportunities": n_opp, "observations": n_obs,
-                    "outcomes": n_out}
+            return {"opportunities": n_opp, "scan_events": n_ev,
+                    "observations": n_obs, "outcomes": n_out}
         except Exception:
             return {}
 
@@ -472,22 +668,71 @@ def _get_store():
     return _store
 
 
+# مخزن مؤقت لرفضات الـprefilter — تُصرَّف دفعة واحدة في run_collection
+# (حلقة التصفية حرجة زمنياً: لا I/O فيها إطلاقاً).
+_prefilter_buffer = []
+_PREFILTER_BUF_CAP = 5000
+
+
+def note_prefilter_reject(p, reason):
+    """تخزين مؤقت لرفض مبكر — يُصرَّف في run_collection. fail-safe."""
+    try:
+        if len(_prefilter_buffer) >= _PREFILTER_BUF_CAP:
+            del _prefilter_buffer[:1000]
+        _prefilter_buffer.append((p, reason))
+    except Exception:
+        pass
+
+
+def _drain_prefilter_rejects(rs):
+    items = _prefilter_buffer[:]
+    del _prefilter_buffer[:]
+    n = 0
+    for p, reason in items:
+        try:
+            if rs.record_prefilter_reject(p, reason):
+                n += 1
+        except Exception:
+            continue
+    return n
+
+
+def note_reevaluation(res):
+    """إعادة تقييم من لائحة الانتظار — تحديث مباشر fail-safe
+    (n_seen + لقطة فحص)، تُستدعى من check_waitlist بعد run_collection."""
+    try:
+        rs = _get_store()
+        if rs.record_opportunity(res):
+            rs.record_scan_event(res, time.time())
+    except Exception as e:
+        print("research.note_reevaluation skipped:", e)
+
+
 def run_collection(results, price_fetcher=None):
-    """تسجيل الفرص + تتبع الأسعار. تُستدعى من _scan بعد scan_new_coins.
+    """تسجيل الفرص + لقطات الفحص + تتبع الأسعار + إغلاق المنتهية.
+    تُستدعى من _scan بعد scan_new_coins.
     price_fetcher: دالة (chain, pair) → dict بيانات الزوج (للحقن في
     الاختبارات). لا ترفع أبداً."""
     try:
         rs = _get_store()
+        scan_ts = time.time()
+        n_rej = _drain_prefilter_rejects(rs)
         n_new = 0
+        n_ev = 0
         for res in (results or []):
             try:
                 if rs.record_opportunity(res):
                     n_new += 1
+                    if rs.record_scan_event(res, scan_ts):
+                        n_ev += 1
             except Exception:
                 continue
         n_obs = _track_open(rs, price_fetcher)
-        if n_new or n_obs:
-            print(f"  -> بحث: {n_new} فرصة مسجلة، {n_obs} ملاحظة سعرية")
+        n_fin = rs.finalize_due()
+        if n_new or n_obs or n_rej or n_fin:
+            print(f"  -> بحث: {n_new} فرصة، {n_rej} رفض مبكر، "
+                  f"{n_ev} لقطة فحص، {n_obs} ملاحظة سعرية، "
+                  f"{n_fin} إغلاق نهائي")
     except Exception as e:
         print("research.run_collection skipped:", e)
 
