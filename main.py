@@ -18,8 +18,7 @@ import alerts
 import expert
 import state as st
 from statelock import state_locked
-from config import (
-    CHAINS, SCAN_LIMIT, MIN_LIQUIDITY_USD, MIN_VOLUME_24H_USD,
+from config import (CHAINS, SCAN_LIMIT, MIN_LIQUIDITY_USD, MIN_VOLUME_24H_USD,
     MIN_TXNS_24H, MAX_PAIR_AGE_DAYS, WATCHLIST, TAKE_PROFITS, STOP_LOSS,
     TRAIL_PCT, MOMENTUM_CUTOFF_H, MOMENTUM_MIN_GAIN,
     POSITION_MAX_AGE_H, DIGEST_HOURS_UTC, USE_COINGECKO, USE_NEWS,
@@ -1510,9 +1509,14 @@ def _sos_alert(error):
         print("SOS failed:", e)
 
 
+class ScanTimeout(BaseException):
+    """مهلة الفحص — ترث من BaseException حتى لا تُبتلعها except Exception."""
+    pass
+
+
 def _scan_timeout_handler(signum, frame):
     """يُقاطع الفحص المعلّق بعد 120 ثانية — يحرّر القفل للفحص التالي."""
-    raise TimeoutError("انتهت مهلة الفحص (120 ثانية)")
+    raise ScanTimeout("انتهت مهلة الفحص (120 ثانية)")
 
 
 def main():
@@ -1527,15 +1531,18 @@ def main():
     # حد دفاعي 120 ثانية ضد التجمّد: يُجهَض الفحص المعلّق ويُحرَّر القفل
     # تلقائياً — الفحص التالي (بعد دقيقة) يبدأ نظيفاً بدل 30 دقيقة توقف.
     signal.signal(signal.SIGALRM, _scan_timeout_handler)
-    signal.alarm(120)
+    
     try:
         _run(a)
+    except ScanTimeout:
+        # المهلة قاتلة عمداً: لا SOS، لا ابتلاع — العملية تموت والقفل يُحرَّر
+        print("[!] انتهت مهلة 120 ثانية — إنهاء قسري")
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
         print(f"[!] انهيار غير متوقع: {e}")
         if not a.dry_run:
-            # SOS alert gets max 30s — never hang the process on Telegram API
             signal.alarm(30)
             try:
                 _sos_alert(e)
@@ -1543,9 +1550,10 @@ def main():
                 print(f"[!] SOS failed: {sos_e}")
             finally:
                 signal.alarm(0)
-        raise  # يفشل الـworkflow بعلامة حمراء — وضوح كامل
+        raise
     finally:
         signal.alarm(0)
+    signal.alarm(0)
 
 
 def _plain(text):
