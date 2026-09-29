@@ -58,10 +58,11 @@ class PaperWallet:
         if sl_dist <= 0:
             return None, "bad_sl"
 
-        # حجم المركز: مخاطرة 2% من الرصيد
+        # حجم المركز: مخاطرة متدرجة مع قوة الإشارة (3.09% → 6.67% مثل Kdrx)
         equity = self.equity()
-        risk_amount = equity * config.RISK_PER_TRADE
-        qty = risk_amount / sl_dist  # الكمية بحيث خسارة الوقف = 2%
+        risk_frac = signal.get("risk_frac", config.RISK_PER_TRADE)
+        risk_amount = equity * risk_frac
+        qty = risk_amount / sl_dist  # الكمية بحيث خسارة الوقف = المخاطرة المحددة
         notional = qty * entry
 
         # لا نسمح برافعة: القيمة الاسمية ≤ الرصيد المتاح
