@@ -1,0 +1,126 @@
+# -*- coding: utf-8 -*-
+"""المنفذ الآلي: فتح المراكز من الإشارات + مراقبة TP/SL."""
+
+import time
+
+import config
+from scanner import fetch_price
+from wallet import PaperWallet
+
+
+class Executor:
+    def __init__(self, wallet=None):
+        self.wallet = wallet or PaperWallet()
+
+    # ---------- معالجة إشارات جديدة ----------
+
+    def process_signals(self, signals):
+        """فتح مراكز ورقية للإشارات الجديدة. يُرجع قائمة الأحداث."""
+        events = []
+        for sig in signals:
+            pos_id, result = self.wallet.open_position(sig)
+            if pos_id:
+                events.append({
+                    "type": "opened",
+                    "pos_id": pos_id,
+                    "signal": sig,
+                    "position": result,
+                })
+                print(f"[EXEC] OPENED {sig['symbol']} {sig['direction']} qty={result['qty']}", flush=True)
+            else:
+                print(f"[EXEC] Skip {sig['symbol']}: {result}", flush=True)
+        return events
+
+    # ---------- مراقبة المراكز المفتوحة ----------
+
+    def check_positions(self):
+        """فحص كل مركز مفتوح مقابل السعر الحالي → أحداث TP/SL."""
+        events = []
+        open_pos = self.wallet.open_positions()
+        if not open_pos:
+            return events
+
+        # جلب الأسعار (طلب واحد لكل رمز)
+        prices = {}
+        for pid, p in open_pos.items():
+            sym = p["symbol"]
+            if sym not in prices:
+                prices[sym] = fetch_price(sym)
+                time.sleep(0.15)
+
+        for pid, p in open_pos.items():
+            price = prices.get(p["symbol"])
+            if price is None:
+                continue
+            ev = self._check_one(pid, p, price)
+            if ev:
+                events.append(ev)
+        return events
+
+    def _check_one(self, pid, p, price):
+        direction = p["direction"]
+        is_long = direction == "long"
+
+        # تحديد ما تم لمسه
+        if is_long:
+            hit_sl = price <= p["sl"]
+            hit_tp1 = not p["tp1_hit"] and price >= p["tp1"]
+            hit_tp2 = not p["tp2_hit"] and price >= p["tp2"]
+            hit_tp3 = price >= p["tp3"]
+        else:
+            hit_sl = price >= p["sl"]
+            hit_tp1 = not p["tp1_hit"] and price <= p["tp1"]
+            hit_tp2 = not p["tp2_hit"] and price <= p["tp2"]
+            hit_tp3 = price <= p["tp3"]
+
+        # الأولوية: وقف الخسارة أولاً (حماية)
+        if hit_sl:
+            ev = self.wallet.partial_close(pid, p["remaining_pct"], price, "SL")
+            if ev:
+                ev["type"] = "sl_hit"
+                print(f"[EXEC] SL HIT {p['symbol']} pnl={ev['pnl']}", flush=True)
+            return ev
+
+        # الأهداف بالترتيب
+        if hit_tp3:
+            # إغلاق المتبقي كاملاً
+            ev = self.wallet.partial_close(pid, p["remaining_pct"], price, "TP3")
+            if ev:
+                ev["type"] = "tp3_hit"
+                p2 = self.wallet.data["positions"][pid]
+                p2["tp3_hit"] = True
+                self.wallet.save()
+                print(f"[EXEC] TP3 HIT {p['symbol']} pnl={ev['pnl']}", flush=True)
+            return ev
+
+        if hit_tp2:
+            ev = self.wallet.partial_close(pid, config.TP2_CLOSE_PCT, price, "TP2")
+            if ev:
+                ev["type"] = "tp2_hit"
+                p2 = self.wallet.data["positions"][pid]
+                p2["tp2_hit"] = True
+                self.wallet.save()
+                print(f"[EXEC] TP2 HIT {p['symbol']} pnl={ev['pnl']}", flush=True)
+            return ev
+
+        if hit_tp1:
+            ev = self.wallet.partial_close(pid, config.TP1_CLOSE_PCT, price, "TP1")
+            if ev:
+                ev["type"] = "tp1_hit"
+                p2 = self.wallet.data["positions"][pid]
+                p2["tp1_hit"] = True
+                self.wallet.save()
+                # نقل وقف الخسارة للتعادل (صفقة خالية المخاطر)
+                self.wallet.move_sl_to_breakeven(pid)
+                print(f"[EXEC] TP1 HIT {p['symbol']} pnl={ev['pnl']} → SL→breakeven", flush=True)
+            return ev
+
+        return None
+
+
+if __name__ == "__main__":
+    ex = Executor()
+    print("[EXEC] Checking open positions...", flush=True)
+    evs = ex.check_positions()
+    print(f"[EXEC] {len(evs)} events", flush=True)
+    print("[EXEC] Stats:", ex.wallet.stats(), flush=True)
