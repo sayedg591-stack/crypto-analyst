@@ -1,0 +1,177 @@
+# -*- coding: utf-8 -*-
+"""المحفظة الورقية: $100 افتراضية، تتبع المراكز والصفقات المغلقة."""
+
+import json
+import os
+import time
+
+import config
+
+
+class PaperWallet:
+    def __init__(self, path=None):
+        self.path = path or config.WALLET_FILE
+        self.data = self._load()
+
+    def _load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {
+            "cash": config.STARTING_CASH,
+            "start": config.STARTING_CASH,
+            "positions": {},       # signal_id → position
+            "closed_trades": [],
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pnl": 0.0,
+        }
+
+    def save(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.data, f, indent=2)
+        os.replace(tmp, self.path)
+
+    # ---------- فتح مركز ----------
+
+    def open_position(self, signal):
+        """فتح مركز ورقي من إشارة. يُرجع (position_id, position) أو (None, reason)."""
+        pos = self.data["positions"]
+        if len(pos) >= config.MAX_POSITIONS:
+            return None, "max_positions"
+
+        symbol = signal["symbol"]
+        # لا مركزين مفتوحين لنفس الزوج
+        for p in pos.values():
+            if p["symbol"] == symbol and p["status"] == "open":
+                return None, "already_open"
+
+        entry = signal["entry"]
+        sl = signal["sl"]
+        sl_dist = abs(entry - sl)
+        if sl_dist <= 0:
+            return None, "bad_sl"
+
+        # حجم المركز: مخاطرة 2% من الرصيد
+        equity = self.equity()
+        risk_amount = equity * config.RISK_PER_TRADE
+        qty = risk_amount / sl_dist  # الكمية بحيث خسارة الوقف = 2%
+        notional = qty * entry
+
+        # لا نسمح برافعة: القيمة الاسمية ≤ الرصيد المتاح
+        if notional > self.data["cash"]:
+            # تقليل الكمية لتناسب النقد المتاح
+            qty = self.data["cash"] / entry
+            notional = qty * entry
+            if qty * sl_dist < 0.01:  # مخاطرة ضئيلة جداً
+                return None, "insufficient_cash"
+
+        pos_id = f"{symbol}-{signal['created_at']}"
+        position = {
+            "id": pos_id,
+            "symbol": symbol,
+            "direction": signal["direction"],
+            "entry": entry,
+            "qty": round(qty, 6),
+            "notional": round(notional, 2),
+            "sl": sl,
+            "sl_original": sl,
+            "tp1": signal["tp1"],
+            "tp2": signal["tp2"],
+            "tp3": signal["tp3"],
+            "tp1_hit": False,
+            "tp2_hit": False,
+            "tp3_hit": False,
+            "remaining_pct": 1.0,
+            "realized_pnl": 0.0,
+            "status": "open",
+            "opened_at": int(time.time()),
+            "signal_strength": signal["strength"],
+        }
+        pos[pos_id] = position
+        self.save()
+        return pos_id, position
+
+    # ---------- إغلاق جزئي / كامل ----------
+
+    def partial_close(self, pos_id, pct, price, reason):
+        """إغلاق نسبة من المركز بسعر معين."""
+        pos = self.data["positions"].get(pos_id)
+        if not pos or pos["status"] != "open":
+            return None
+        close_qty = pos["qty"] * pct
+        if pos["direction"] == "long":
+            pnl = (price - pos["entry"]) * close_qty
+        else:
+            pnl = (pos["entry"] - price) * close_qty
+        pos["qty"] = round(pos["qty"] - close_qty, 6)
+        pos["remaining_pct"] = round(pos["remaining_pct"] - pct, 4)
+        pos["realized_pnl"] = round(pos["realized_pnl"] + pnl, 4)
+        self.data["cash"] = round(self.data["cash"] + pnl, 4)
+        self.data["total_pnl"] = round(self.data["total_pnl"] + pnl, 4)
+        event = {
+            "pos_id": pos_id, "symbol": pos["symbol"],
+            "pct": pct, "price": price, "pnl": round(pnl, 4),
+            "reason": reason, "at": int(time.time()),
+        }
+        if pos["remaining_pct"] <= 0.001:
+            pos["status"] = "closed"
+            pos["closed_at"] = int(time.time())
+            pos["close_reason"] = reason
+            self._record_closed(pos)
+        self.save()
+        return event
+
+    def move_sl_to_breakeven(self, pos_id):
+        pos = self.data["positions"].get(pos_id)
+        if pos and pos["status"] == "open":
+            pos["sl"] = pos["entry"]
+            self.save()
+
+    def _record_closed(self, pos):
+        self.data["total_trades"] += 1
+        if pos["realized_pnl"] > 0:
+            self.data["wins"] += 1
+        else:
+            self.data["losses"] += 1
+        self.data["closed_trades"].append({
+            "id": pos["id"], "symbol": pos["symbol"],
+            "direction": pos["direction"], "entry": pos["entry"],
+            "pnl": pos["realized_pnl"],
+            "pnl_pct": round(pos["realized_pnl"] / pos["notional"] * 100, 2) if pos["notional"] else 0,
+            "reason": pos.get("close_reason", "?"),
+            "opened_at": pos["opened_at"],
+            "closed_at": pos.get("closed_at", int(time.time())),
+        })
+
+    # ---------- إحصائيات ----------
+
+    def equity(self):
+        """الرصيد الكلي = النقد + الربح المحقق (غير المحقق يُحسب عند الإغلاق)."""
+        return round(self.data["cash"], 2)
+
+    def open_positions(self):
+        return {k: v for k, v in self.data["positions"].items() if v["status"] == "open"}
+
+    def stats(self):
+        d = self.data
+        total = d["total_trades"]
+        win_rate = round(d["wins"] / total * 100, 1) if total else 0
+        ret = round((d["cash"] - d["start"]) / d["start"] * 100, 2)
+        return {
+            "cash": round(d["cash"], 2),
+            "start": d["start"],
+            "return_pct": ret,
+            "total_trades": total,
+            "wins": d["wins"],
+            "losses": d["losses"],
+            "win_rate": win_rate,
+            "total_pnl": round(d["total_pnl"], 2),
+            "open_count": len(self.open_positions()),
+        }
