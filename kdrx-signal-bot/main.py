@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""المنسق الرئيسي: فحص كل 15 دقيقة → إشارات → تنفيذ → نشر."""
+"""المنسق الرئيسي: فحص كل 5 دقائق → إشارات → تنفيذ → نشر."""
 
 import json
 import logging
@@ -53,14 +53,13 @@ def is_cooldown_ok(state, symbol):
     return (time.time() - last) > config.SIGNAL_COOLDOWN_HOURS * 3600
 
 
-def run_cycle():
-    """دورة واحدة: فحص → تنفيذ → مراقبة → نشر."""
-    log.info("=== Cycle start ===")
+def run_scan_only():
+    """فحص الإشارات فقط (cron كل 5 دقائق): فحص → فتح مراكز → نشر."""
+    log.info("=== Scan cycle start ===")
+    t0 = time.time()
     wallet = PaperWallet()
-    ex = Executor(wallet)
     state = load_signals_state()
 
-    # 1. فحص الإشارات
     try:
         signals = scan_all()
         sources.report("binance", True)
@@ -68,13 +67,10 @@ def run_cycle():
         log.warning(f"Scanner failed: {e}")
         sources.report("binance", False)
         signals = []
-    log.info(f"Scanner found {len(signals)} raw signals")
 
-    # 2. فلترة الـ cooldown
     fresh = [s for s in signals if is_cooldown_ok(state, s["symbol"])]
     log.info(f"{len(fresh)} signals pass cooldown filter")
 
-    # 3. فتح المراكز + نشر الإشارات
     for sig in fresh:
         pos_id, result = wallet.open_position(sig)
         if pos_id:
@@ -84,26 +80,27 @@ def run_cycle():
         else:
             log.info(f"Skipped {sig['symbol']}: {result}")
 
-    # 4. مراقبة المراكز المفتوحة
+    save_signals_state(state)
+    dt = time.time() - t0
+    log.info(f"=== Scan cycle end: {dt:.1f}s, {len(fresh)} new, equity=${wallet.equity():.2f} ===")
+    publish_gist(wallet)
+    return {"signals": len(fresh), "seconds": round(dt, 1)}
+
+
+def run_monitor_only():
+    """مراقبة المراكز فقط (cron كل دقيقتين): TP/SL سريع → نشر."""
+    log.info("=== Monitor cycle start ===")
+    t0 = time.time()
+    wallet = PaperWallet()
+    ex = Executor(wallet)
+
     events = ex.check_positions()
     for ev in events:
         publisher.publish_event(ev)
         log.info(f"Published event {ev['reason']} {ev['symbol']} pnl={ev['pnl']}")
 
-    save_signals_state(state)
-
-    # 5. الملخص اليومي (مرة واحدة يومياً)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if state.get("last_summary") != today:
-        hour = datetime.now(timezone.utc).hour
-        if hour >= 8:  # بعد 08:00 UTC
-            stats = wallet.stats()
-            publisher.publish_summary(stats)
-            state["last_summary"] = today
-            save_signals_state(state)
-            log.info("Published daily summary")
-
-    # 5b. نبض السوق (كل 6 ساعات)
+    # نبض السوق كل 6 ساعات
+    state = load_signals_state()
     last_pulse = state.get("last_pulse", 0)
     if time.time() - last_pulse > 6 * 3600:
         try:
@@ -116,9 +113,14 @@ def run_cycle():
         except Exception as e:
             log.warning(f"Market pulse failed: {e}")
 
-    log.info(f"=== Cycle end: equity=${wallet.equity():.2f} ===")
-    
-    # 6. نشر الحالة إلى Gist للـ dashboard
+    dt = time.time() - t0
+    log.info(f"=== Monitor cycle end: {dt:.1f}s, {len(events)} events, equity=${wallet.equity():.2f} ===")
+    publish_gist(wallet)
+    return {"events": len(events), "seconds": round(dt, 1)}
+
+
+def publish_gist(wallet):
+    """نشر الحالة إلى Gist للـ dashboard (مزامنة)."""
     try:
         gist_state = {
             "wallet": wallet.to_dict(),
@@ -129,8 +131,6 @@ def run_cycle():
         gist_pub.publish(gist_state)
     except Exception as e:
         log.warning(f"Gist publish failed: {e}")
-    
-    return {"signals": len(fresh), "events": len(events), "equity": wallet.equity()}
 
 
 def main():
@@ -138,7 +138,8 @@ def main():
     publisher.publish_startup()
     while True:
         try:
-            run_cycle()
+            run_scan_only()
+            run_monitor_only()
         except Exception as e:
             log.exception(f"Cycle failed: {e}")
         log.info(f"Sleeping {config.SCAN_INTERVAL_MINUTES} min...")
@@ -146,12 +147,30 @@ def main():
 
 
 def run_once():
-    """تشغيل دورة واحدة (للـ cron)."""
-    return run_cycle()
+    """تشغيل دورة واحدة (للـ cron) — فحص + مراقبة."""
+    r1 = run_scan_only()
+    r2 = run_monitor_only()
+    # الملخص اليومي
+    state = load_signals_state()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if state.get("last_summary") != today:
+        hour = datetime.now(timezone.utc).hour
+        if hour >= 8:
+            wallet = PaperWallet()
+            publisher.publish_summary(wallet.stats())
+            state["last_summary"] = today
+            save_signals_state(state)
+            log.info("Published daily summary")
+    return {**r1, **r2}
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--once":
-        run_once()
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--once":
+            run_once()
+        elif sys.argv[1] == "--scan":
+            run_scan_only()
+        elif sys.argv[1] == "--monitor":
+            run_monitor_only()
     else:
         main()
