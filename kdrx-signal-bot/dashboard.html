@@ -1,1 +1,111 @@
-<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>بوت الإشارات KDRX</title><style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Segoe UI',Tahoma,sans-serif;background:#0f1419;color:#e7e9ea;padding:20px}.container{max-width:900px;margin:0 auto}h1{text-align:center;margin-bottom:20px;color:#1d9bf0}.card{background:#1c2733;border-radius:12px;padding:20px;margin-bottom:16px}.card h2{margin-bottom:12px;color:#ffd400;font-size:1.1em}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}.stat{background:#273340;border-radius:8px;padding:12px;text-align:center}.stat .label{font-size:.8em;color:#8b98a5;margin-bottom:4px}.stat .value{font-size:1.4em;font-weight:bold}.green{color:#00ba7c}.red{color:#f4212e}.blue{color:#1d9bf0}table{width:100%;border-collapse:collapse;font-size:.9em}th,td{padding:8px;text-align:center;border-bottom:1px solid #333}th{color:#8b98a5}.badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:.8em}.badge-win{background:#00ba7c33;color:#00ba7c}.badge-loss{background:#f4212e33;color:#f4212e}.updated{text-align:center;color:#8b98a5;font-size:.8em;margin-top:16px}.loading{text-align:center;padding:40px;color:#8b98a5}</style></head><body><div class="container"><h1>🤖 بوت الإشارات KDRX</h1><div id="app"><div class="loading">جاري التحميل...</div></div><div class="updated" id="updated"></div></div><script>const GIST_ID='4f1a5c34fe3f4e64116510a555887f00';async function load(){try{const r=await fetch('https://api.github.com/gists/'+GIST_ID);const g=await r.json();const s=JSON.parse(g.files['kdrx-state.json'].content);render(s);document.getElementById('updated').textContent='آخر تحديث: '+new Date().toLocaleString('ar')}catch(e){document.getElementById('app').innerHTML='<div class="loading">تعذر التحميل</div>'}}function render(s){const w=s.wallet||{};const pos=Object.values(w.positions||{});const closed=w.closed_trades||[];const pnl=w.total_pnl||0;const pc=pnl>=0?'green':'red';const wr=w.total_trades>0?((w.wins/w.total_trades)*100).toFixed(1):'0';let h='<div class="card"><h2>💰 المحفظة الورقية</h2><div class="stats"><div class="stat"><div class="label">الرصيد</div><div class="value blue">$'+(w.cash||0).toFixed(2)+'</div></div><div class="stat"><div class="label">البداية</div><div class="value">$'+(w.start||100).toFixed(2)+'</div></div><div class="stat"><div class="label">P&L</div><div class="value '+pc+'">$'+pnl.toFixed(2)+'</div></div><div class="stat"><div class="label">الصفقات</div><div class="value">'+(w.total_trades||0)+'</div></div><div class="stat"><div class="label">الفوز</div><div class="value">'+wr+'%</div></div><div class="stat"><div class="label">مفتوحة</div><div class="value">'+pos.length+'</div></div></div></div>';h+='<div class="card"><h2>📊 المراكز المفتوحة ('+pos.length+')</h2>';if(pos.length===0)h+='<p style="text-align:center;color:#8b98a5">لا توجد مراكز</p>';else{h+='<table><tr><th>الزوج</th><th>الاتجاه</th><th>الدخول</th><th>القيمة</th><th>SL</th><th>الأهداف</th></tr>';pos.forEach(p=>{h+='<tr><td><b>'+p.symbol+'</b></td><td>'+(p.direction==='long'?'شراء 🟢':'بيع 🔴')+'</td><td>'+p.entry+'</td><td>$'+p.notional.toFixed(2)+'</td><td>'+p.sl.toFixed(2)+'</td><td>🎯'+p.tp1.toFixed(2)+'<br>🎯'+p.tp2.toFixed(2)+'<br>🎯'+p.tp3.toFixed(2)+'</td></tr>')});h+='</table>'}h+='</div>';h+='<div class="card"><h2>📝 المغلقة ('+closed.length+')</h2>';if(closed.length===0)h+='<p style="text-align:center;color:#8b98a5">لا توجد بعد</p>';else{h+='<table><tr><th>الزوج</th><th>الدخول</th><th>الخروج</th><th>P&L</th></tr>';closed.slice(-20).reverse().forEach(t=>{const win=(t.pnl||0)>=0;h+='<tr><td><b>'+t.symbol+'</b></td><td>'+t.entry+'</td><td>'+(t.exit_price||'-')+'</td><td class="'+(win?'green':'red')+'">$'+(t.pnl||0).toFixed(2)+'</td></tr>')});h+='</table>'}h+='</div>';document.getElementById('app').innerHTML=h}load();setInterval(load,60000)</script></body></html>
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>بوت الإشارات KDRX — لوحة المراقبة</title>
+<script src="https://cdn.tailwindcss.com/3.4.16"></script>
+<script src="https://unpkg.com/lucide@1.47.0/dist/umd/lucide.min.js"></script>
+<style>
+  body { background: #070b14; background-image: radial-gradient(600px 300px at 85% -5%, rgba(34,197,94,.08), transparent), radial-gradient(700px 350px at 10% 0%, rgba(59,130,246,.10), transparent), radial-gradient(500px 400px at 50% 110%, rgba(168,85,247,.06), transparent); min-height: 100vh; }
+  .glass { background: rgba(19,23,34,.62); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,.07); border-radius: 1.25rem; box-shadow: 0 8px 32px rgba(0,0,0,.35); }
+  .hero-num { background: linear-gradient(135deg, #fff 30%, #a7f3d0 70%, #34d399); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero-num.neg { background: linear-gradient(135deg, #fff 30%, #fca5a5 70%, #f87171); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .pos { color: #4ade80; } .neg { color: #f87171; }
+  .pulse-dot { position: relative; width: 10px; height: 10px; border-radius: 9999px; background: #4ade80; }
+  .pulse-dot::after { content: ""; position: absolute; inset: -4px; border-radius: 9999px; background: rgba(74,222,128,.4); animation: ping 1.6s cubic-bezier(0,0,.2,1) infinite; }
+  @keyframes ping { 75%, 100% { transform: scale(2); opacity: 0; } }
+  .stat-ic { width: 34px; height: 34px; border-radius: .8rem; display: flex; align-items: center; justify-content: center; background: rgba(255,255,255,.06); }
+  .stat-ic svg { width: 18px; height: 18px; }
+  .chip { font-size: .68rem; padding: .15rem .55rem; border-radius: 9999px; background: rgba(255,255,255,.07); }
+  .trade-card { transition: transform .18s ease, box-shadow .18s ease; }
+  .trade-card:hover { transform: translateY(-3px); box-shadow: 0 12px 40px rgba(0,0,0,.5); }
+</style>
+</head>
+<body class="text-slate-200 min-h-screen">
+<div class="max-w-6xl mx-auto p-4 pb-16">
+  <header class="flex items-center justify-between py-4">
+    <div class="flex items-center gap-3">
+      <div class="stat-ic" style="background:linear-gradient(135deg,#2563eb,#7c3aed)"><i data-lucide="bot" class="text-white"></i></div>
+      <div><h1 class="text-xl font-extrabold">بوت الإشارات KDRX</h1><div class="flex items-center gap-2 text-xs text-slate-400"><span class="pulse-dot"></span><span>مباشر</span><span id="sync-hint" class="text-slate-500">—</span></div></div>
+    </div>
+    <button id="refresh" class="glass px-4 py-2 text-sm font-bold flex items-center gap-2 hover:bg-white/10"><i data-lucide="refresh-cw" class="w-4 h-4"></i> تحديث</button>
+  </header>
+  <div id="app">
+    <section class="glass p-6 mb-5 text-center relative overflow-hidden">
+      <div class="text-xs text-slate-400 mb-1 flex items-center justify-center gap-2"><i data-lucide="wallet" class="w-4 h-4"></i> المحفظة الورقية ($100)</div>
+      <div id="h-equity" class="hero-num text-5xl font-black tracking-tight" dir="ltr">$100.00</div>
+      <div id="h-pnl" class="mt-2 text-sm font-bold">+0.00%</div>
+      <div class="grid grid-cols-3 gap-3 mt-5 text-center">
+        <div><div class="text-[11px] text-slate-500">الرصيد النقدي</div><div id="h-cash" class="font-extrabold" dir="ltr">$—</div></div>
+        <div><div class="text-[11px] text-slate-500">صفقات مفتوحة</div><div id="h-open" class="font-extrabold">—</div></div>
+        <div><div class="text-[11px] text-slate-500">آخر مزامنة</div><div id="h-time" class="font-extrabold text-sm">—</div></div>
+      </div>
+    </section>
+    <section class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
+      <div class="glass p-3 flex items-center gap-3"><div class="stat-ic"><i data-lucide="target" class="text-emerald-400"></i></div><div><div class="text-[11px] text-slate-500">نسبة الفوز</div><div id="s-win" class="font-extrabold text-sm">—</div></div></div>
+      <div class="glass p-3 flex items-center gap-3"><div class="stat-ic"><i data-lucide="trending-up" class="text-sky-400"></i></div><div><div class="text-[11px] text-slate-500">إجمالي P&L</div><div id="s-pnl" class="font-extrabold text-sm" dir="ltr">—</div></div></div>
+      <div class="glass p-3 flex items-center gap-3"><div class="stat-ic"><i data-lucide="list-checks" class="text-violet-400"></i></div><div><div class="text-[11px] text-slate-500">صفقات مغلقة</div><div id="s-closed" class="font-extrabold text-sm">—</div></div></div>
+      <div class="glass p-3 flex items-center gap-3"><div class="stat-ic"><i data-lucide="zap" class="text-amber-400"></i></div><div><div class="text-[11px] text-slate-500">الفريم</div><div class="font-extrabold text-sm">4h سبوت</div></div></div>
+    </section>
+    <section class="mb-5">
+      <h2 class="font-extrabold mb-3 flex items-center gap-2"><i data-lucide="layers" class="w-5 h-5 text-emerald-400"></i> الصفقات المفتوحة <span id="t-count" class="chip"></span></h2>
+      <div id="t-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4"><div class="glass p-6 text-center text-slate-500">جاري التحميل...</div></div>
+    </section>
+    <section class="mb-5">
+      <h2 class="font-extrabold mb-3 flex items-center gap-2"><i data-lucide="history" class="w-5 h-5 text-sky-400"></i> سجل الصفقات المغلقة</h2>
+      <div class="glass p-4"><div id="closed-list" class="text-sm space-y-2"><div class="text-slate-500 text-center">لا توجد صفقات مغلقة بعد</div></div></div>
+    </section>
+    <div class="text-center text-[11px] text-slate-600 mt-8">⚠️ المحفظة وهمية 100% للتجربة — ليست نصيحة مالية</div>
+  </div>
+</div>
+<script>
+const GIST_ID = '4f1a5c34fe3f4e64116510a555887f00';
+async function load() {
+  try {
+    const res = await fetch('https://api.github.com/gists/' + GIST_ID);
+    const gist = await res.json();
+    const state = JSON.parse(gist.files['kdrx-state.json'].content);
+    render(state);
+    document.getElementById('sync-hint').textContent = 'آخر تحديث: ' + new Date().toLocaleTimeString('ar');
+  } catch (e) { console.error(e); }
+}
+function render(s) {
+  const w = s.wallet || {}; const positions = Object.values(w.positions || {}); const closed = w.closed_trades || [];
+  const pnl = w.total_pnl || 0; const equity = (w.cash || 100) + pnl;
+  const retPct = (((w.cash || 100) - (w.start || 100)) / (w.start || 100) * 100).toFixed(2);
+  const winRate = w.total_trades > 0 ? ((w.wins / w.total_trades) * 100).toFixed(1) : '0';
+  const hEquity = document.getElementById('h-equity'); hEquity.textContent = '$' + equity.toFixed(2); hEquity.classList.toggle('neg', pnl < 0);
+  const hPnl = document.getElementById('h-pnl'); hPnl.textContent = (retPct >= 0 ? '+' : '') + retPct + '%'; hPnl.className = 'mt-2 text-sm font-bold ' + (retPct >= 0 ? 'pos' : 'neg');
+  document.getElementById('h-cash').textContent = '$' + (w.cash || 0).toFixed(2);
+  document.getElementById('h-open').textContent = positions.length;
+  document.getElementById('h-time').textContent = s.updated_at ? new Date(s.updated_at).toLocaleTimeString('ar') : '—';
+  document.getElementById('s-win').textContent = winRate + '%';
+  const sPnl = document.getElementById('s-pnl'); sPnl.textContent = '$' + pnl.toFixed(2); sPnl.className = 'font-extrabold text-sm ' + (pnl >= 0 ? 'pos' : 'neg');
+  document.getElementById('s-closed').textContent = closed.length;
+  document.getElementById('t-count').textContent = positions.length;
+  const grid = document.getElementById('t-grid');
+  if (positions.length === 0) { grid.innerHTML = '<div class="glass p-6 text-center text-slate-500 col-span-full">لا توجد صفقات مفتوحة</div>'; }
+  else {
+    grid.innerHTML = positions.map(p => {
+      const dir = p.direction === 'long' ? 'شراء 🟢' : 'بيع 🔴'; const dirColor = p.direction === 'long' ? 'pos' : 'neg';
+      return '<div class="glass p-4 trade-card"><div class="flex items-center justify-between mb-3"><div class="font-extrabold text-lg">' + p.symbol.replace('USDT', '/USDT') + '</div><div class="font-bold text-sm ' + dirColor + '">' + dir + '</div></div><div class="grid grid-cols-2 gap-2 text-sm"><div><div class="text-[11px] text-slate-500">الدخول</div><div class="font-bold" dir="ltr">' + p.entry + '</div></div><div><div class="text-[11px] text-slate-500">القيمة</div><div class="font-bold" dir="ltr">$' + p.notional.toFixed(2) + '</div></div><div><div class="text-[11px] text-slate-500">وقف الخسارة</div><div class="font-bold neg" dir="ltr">' + p.sl.toFixed(2) + '</div></div><div><div class="text-[11px] text-slate-500">قوة الإشارة</div><div class="font-bold">' + p.signal_strength + '/100</div></div></div><div class="mt-3 pt-3 border-t border-white/10"><div class="text-[11px] text-slate-500 mb-1">الأهداف</div><div class="flex gap-2 text-xs" dir="ltr"><span class="chip">🎯1 ' + p.tp1.toFixed(2) + '</span><span class="chip">🎯2 ' + p.tp2.toFixed(2) + '</span><span class="chip">🎯3 ' + p.tp3.toFixed(2) + '</span></div></div></div>';
+    }).join('');
+  }
+  const cl = document.getElementById('closed-list');
+  if (closed.length === 0) { cl.innerHTML = '<div class="text-slate-500 text-center">لا توجد صفقات مغلقة بعد</div>'; }
+  else {
+    cl.innerHTML = closed.slice(-10).reverse().map(t => {
+      const win = (t.pnl || 0) >= 0;
+      return '<div class="flex items-center justify-between py-2 border-b border-white/5"><div class="font-bold">' + t.symbol.replace('USDT', '/USDT') + '</div><div class="text-xs text-slate-500" dir="ltr">' + t.entry + ' → ' + (t.exit_price || '—') + '</div><div class="font-bold ' + (win ? 'pos' : 'neg') + '" dir="ltr">$' + (t.pnl || 0).toFixed(2) + '</div></div>';
+    }).join('');
+  }
+  if (window.lucide) lucide.createIcons();
+}
+document.getElementById('refresh').addEventListener('click', load);
+load(); setInterval(load, 60000);
+if (window.lucide) lucide.createIcons();
+</script>
+</body>
+</html>
