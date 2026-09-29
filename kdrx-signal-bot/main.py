@@ -14,6 +14,8 @@ from wallet import PaperWallet
 from executor import Executor
 import publisher
 import gist_pub
+import sysstats
+import sources
 
 # ---------- السجلات ----------
 os.makedirs(config.STATE_DIR, exist_ok=True)
@@ -59,7 +61,13 @@ def run_cycle():
     state = load_signals_state()
 
     # 1. فحص الإشارات
-    signals = scan_all()
+    try:
+        signals = scan_all()
+        sources.report("binance", True)
+    except Exception as e:
+        log.warning(f"Scanner failed: {e}")
+        sources.report("binance", False)
+        signals = []
     log.info(f"Scanner found {len(signals)} raw signals")
 
     # 2. فلترة الـ cooldown
@@ -101,6 +109,8 @@ def run_cycle():
     try:
         gist_state = {
             "wallet": wallet.to_dict(),
+            "system": sysstats.get_stats(),
+            "sources": sources.get_status(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         gist_pub.publish(gist_state)
