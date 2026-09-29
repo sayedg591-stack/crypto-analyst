@@ -1587,7 +1587,7 @@ def _sync_publish(s, dry_run):
     gist_err = ""
     ok = False
     for attempt in range(3):
-        _save_ok, _save_err = st.save(s)
+        _save_ok, _save_err, _ = st.save(s)
         if _save_err:
             gist_err = _save_err
         ok = st.verify_gist_changed(before)
