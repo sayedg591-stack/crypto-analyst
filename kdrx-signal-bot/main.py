@@ -75,7 +75,8 @@ def run_scan_only():
         pos_id, result = wallet.open_position(sig)
         if pos_id:
             state["seen"][sig["symbol"]] = int(time.time())
-            publisher.publish_signal(sig, result)
+            msg_id = publisher.publish_signal(sig, result)
+            wallet.set_signal_msg_id(pos_id, msg_id)  # للاقتباس عند TP/SL مثل Kdrx
             log.info(f"Published signal {sig['symbol']} {sig['direction']}")
         else:
             log.info(f"Skipped {sig['symbol']}: {result}")
@@ -96,7 +97,12 @@ def run_monitor_only():
 
     events = ex.check_positions()
     for ev in events:
-        publisher.publish_event(ev)
+        # اقتباس الإشارة الأصلية (reply) مثل Kdrx
+        reply_to = None
+        pos = wallet.data["positions"].get(ev.get("pos_id", ""))
+        if pos:
+            reply_to = pos.get("signal_msg_id")
+        publisher.publish_event(ev, reply_to=reply_to)
         log.info(f"Published event {ev['reason']} {ev['symbol']} pnl={ev['pnl']}")
 
     # نبض السوق كل 6 ساعات
