@@ -93,10 +93,18 @@ class PaperWallet:
             "status": "open",
             "opened_at": int(time.time()),
             "signal_strength": signal["strength"],
+            "signal_msg_id": None,  # message_id لرسالة الإشارة (للاقتباس reply عند TP/SL)
         }
         pos[pos_id] = position
         self.save()
         return pos_id, position
+
+    def set_signal_msg_id(self, pos_id, msg_id):
+        """حفظ message_id لرسالة الإشارة الأصلية."""
+        pos = self.data["positions"].get(pos_id)
+        if pos and msg_id:
+            pos["signal_msg_id"] = msg_id
+            self.save()
 
     # ---------- إغلاق جزئي / كامل ----------
 
