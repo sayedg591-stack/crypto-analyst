@@ -13,6 +13,7 @@ from scanner import scan_all
 from wallet import PaperWallet
 from executor import Executor
 import publisher
+import gist_pub
 
 # ---------- السجلات ----------
 os.makedirs(config.STATE_DIR, exist_ok=True)
@@ -95,6 +96,17 @@ def run_cycle():
             log.info("Published daily summary")
 
     log.info(f"=== Cycle end: equity=${wallet.equity():.2f} ===")
+    
+    # 6. نشر الحالة إلى Gist للـ dashboard
+    try:
+        gist_state = {
+            "wallet": wallet.to_dict(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        gist_pub.publish(gist_state)
+    except Exception as e:
+        log.warning(f"Gist publish failed: {e}")
+    
     return {"signals": len(fresh), "events": len(events), "equity": wallet.equity()}
 
 
