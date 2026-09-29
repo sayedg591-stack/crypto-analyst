@@ -13,13 +13,18 @@ import json
 import os
 import time
 
+
 import requests
 
+
 from config import PAPER_START_BALANCE, STRATEGY_VERSION
+
 
 PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 GIST_API = "https://api.github.com/gists"
 ALERTED_TTL = 48 * 3600  # تنبيهات أقدم من 48 ساعة تُحذف (منع تضخم الحالة)
+
+
 
 
 def _gist_headers():
@@ -28,6 +33,8 @@ def _gist_headers():
         return None
     return {"Authorization": f"Bearer {tok}",
             "Accept": "application/vnd.github+json"}
+
+
 
 
 def gist_load():
@@ -55,20 +62,24 @@ def gist_load():
         return None
 
 
+
+
 def gist_save(s):
-    """يكتب state.json في الـGist السري. يعيد True/False (best effort)."""
+    """يكتب state.json في الـGist. يعيد (ok, err_detail)."""
     gid = os.environ.get("GIST_ID")
     headers = _gist_headers()
     if not gid or not headers:
-        return False
+        return False, "no_gid_or_token"
     try:
         r = requests.patch(
             f"{GIST_API}/{gid}", headers=headers, timeout=15,
             json={"files": {"state.json": {
                 "content": json.dumps(s, ensure_ascii=False)}}})
-        return r.status_code == 200
-    except Exception:
-        return False
+        if r.status_code == 200:
+            return True, ""
+        return False, f"http_{r.status_code}:{r.text[:200]}"
+    except Exception as e:
+        return False, f"exc_{type(e).__name__}:{str(e)[:200]}"
 
 
 def gist_updated_at():
@@ -214,11 +225,13 @@ def load():
 
 
 def save(s):
+    """يحفظ الحالة محلياً وفي الـGist. يعيد (ok, err_detail)."""
     if not _assert_no_secrets(s):
-        return  # fail-closed: لا نحفظ أسراراً في الـGist العام أبداً
+        return False, "forbidden_keys"  # fail-closed: لا نحفظ أسراراً في الـGist العام أبداً
     s = _prune(s)
     _file_save(s)   # محلي (للـcache)
-    gist_save(s)    # سحابي (الأساسي — best effort)
+    ok, err = gist_save(s)    # سحابي (الأساسي — best effort)
+    return ok, err
 
 
 # ---------- ذاكرة الخبير: نتائج الإشارات السابقة ----------
