@@ -175,3 +175,17 @@ class PaperWallet:
             "total_pnl": round(d["total_pnl"], 2),
             "open_count": len(self.open_positions()),
         }
+
+    def to_dict(self):
+        """الحالة الكاملة للـ dashboard."""
+        d = self.data
+        return {
+            "cash": round(d["cash"], 2),
+            "start": d["start"],
+            "positions": self.open_positions(),
+            "closed_trades": d.get("closed_trades", []),
+            "total_trades": d["total_trades"],
+            "wins": d["wins"],
+            "losses": d["losses"],
+            "total_pnl": round(d["total_pnl"], 2),
+        }
