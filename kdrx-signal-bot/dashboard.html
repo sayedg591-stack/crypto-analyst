@@ -1,202 +1,388 @@
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>بوت الإشارات KDRX - لوحة التحكم</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<script src="https://unpkg.com/lucide@latest"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>بوت الإشارات KDRX — لوحة المراقبة</title>
+<script src="https://cdn.tailwindcss.com/3.4.16"></script>
+<script src="https://unpkg.com/lucide@1.47.0/dist/umd/lucide.min.js"></script>
 <style>
-* { box-sizing: border-box; }
-body {
-  font-family: 'Segoe UI', Tahoma, sans-serif;
-  background: linear-gradient(135deg, #0f1419 0%, #1a2332 50%, #0f1419 100%);
-  color: #e7e9ea; min-height: 100vh; padding: 20px;
-}
-.glass {
-  background: rgba(28, 39, 51, 0.7);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 16px;
-}
-.container { max-width: 1100px; margin: 0 auto; }
-.tab-btn {
-  padding: 6px 16px; border-radius: 20px; font-size: 0.85em;
-  background: rgba(255,255,255,0.05); color: #8b98a5;
-  border: 1px solid rgba(255,255,255,0.08); cursor: pointer;
-  transition: all 0.2s;
-}
-.tab-btn:hover { background: rgba(255,255,255,0.1); }
-.tab-btn.active { background: #1d9bf0; color: white; border-color: #1d9bf0; }
-.progress-bg { background: rgba(255,255,255,0.08); border-radius: 8px; height: 8px; overflow: hidden; }
-.progress-fill { height: 100%; border-radius: 8px; transition: width 0.5s; }
-.source-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-left: 6px; }
-.dot-up { background: #00ba7c; box-shadow: 0 0 8px #00ba7c; }
-.dot-down { background: #f4212e; box-shadow: 0 0 8px #f4212e; }
-.dot-degraded { background: #ffd400; box-shadow: 0 0 8px #ffd400; }
-.dot-unknown { background: #8b98a5; }
-table { width: 100%; border-collapse: collapse; font-size: 0.85em; }
-th, td { padding: 10px 8px; text-align: center; border-bottom: 1px solid rgba(255,255,255,0.05); }
-th { color: #8b98a5; font-weight: 600; font-size: 0.8em; }
-.badge { display: inline-block; padding: 3px 12px; border-radius: 12px; font-size: 0.78em; font-weight: 600; }
-.badge-win { background: rgba(0,186,124,0.15); color: #00ba7c; }
-.badge-loss { background: rgba(244,33,46,0.15); color: #f4212e; }
-.badge-open { background: rgba(29,155,240,0.15); color: #1d9bf0; }
+  body {
+    background: #070b14;
+    background-image:
+      radial-gradient(600px 300px at 85% -5%, rgba(34,197,94,.08), transparent),
+      radial-gradient(700px 350px at 10% 0%, rgba(59,130,246,.10), transparent),
+      radial-gradient(500px 400px at 50% 110%, rgba(168,85,247,.06), transparent);
+    min-height: 100vh;
+  }
+  .glass {
+    background: rgba(19,23,34,.62);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    border: 1px solid rgba(255,255,255,.07);
+    border-radius: 1.25rem;
+    box-shadow: 0 8px 32px rgba(0,0,0,.35);
+  }
+  .hero-num {
+    background: linear-gradient(135deg, #fff 30%, #a7f3d0 70%, #34d399);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .hero-num.neg {
+    background: linear-gradient(135deg, #fff 30%, #fca5a5 70%, #f87171);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .pos { color: #4ade80; text-shadow: 0 0 18px rgba(74,222,128,.35); }
+  .neg { color: #f87171; text-shadow: 0 0 18px rgba(248,113,113,.30); }
+  .pulse-dot { position: relative; width: 10px; height: 10px; border-radius: 9999px; background: #4ade80; }
+  .pulse-dot::after {
+    content: ""; position: absolute; inset: -4px; border-radius: 9999px;
+    background: rgba(74,222,128,.4); animation: ping 1.6s cubic-bezier(0,0,.2,1) infinite;
+  }
+  @keyframes ping { 75%, 100% { transform: scale(2); opacity: 0; } }
+  .skel {
+    background: linear-gradient(90deg, rgba(255,255,255,.04) 25%, rgba(255,255,255,.09) 50%, rgba(255,255,255,.04) 75%);
+    background-size: 200% 100%; animation: shimmer 1.4s infinite; border-radius: 1.25rem;
+  }
+  @keyframes shimmer { to { background-position: -200% 0; } }
+  .trade-card { scroll-margin-top: 90px; transition: transform .18s ease, box-shadow .18s ease; }
+  .trade-card:hover { transform: translateY(-3px); box-shadow: 0 12px 40px rgba(0,0,0,.5); }
+  .chip { font-size: .68rem; padding: .15rem .55rem; border-radius: 9999px; background: rgba(255,255,255,.07); }
+  .ftab { cursor: pointer; transition: all .15s; }
+  .ftab:hover { background: rgba(255,255,255,.14); }
+  .ftab.active { background: linear-gradient(135deg, #2563eb, #7c3aed); color: #fff; box-shadow: 0 4px 14px rgba(59,130,246,.35); }
+  .cftab { cursor: pointer; transition: all .15s; }
+  .cftab:hover { background: rgba(255,255,255,.14); }
+  .cftab.active { background: linear-gradient(135deg, #0ea5e9, #2563eb); color: #fff; box-shadow: 0 4px 14px rgba(14,165,233,.35); }
+  .stat-ic { width: 34px; height: 34px; border-radius: .8rem; display: flex; align-items: center; justify-content: center; background: rgba(255,255,255,.06); }
+  .stat-ic svg { width: 18px; height: 18px; }
+  .bar { height: 6px; border-radius: 9999px; background: rgba(255,255,255,.08); overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 9999px; background: linear-gradient(90deg, #34d399, #fbbf24, #f87171); transition: width .6s ease; }
+  .scroll-dark { scrollbar-width: thin; scrollbar-color: rgba(96,165,250,.45) rgba(255,255,255,.03); }
+  .scroll-dark::-webkit-scrollbar { width: 8px; }
+  .scroll-dark::-webkit-scrollbar-track { background: rgba(255,255,255,.03); border-radius: 9999px; margin: 6px 0; }
+  .scroll-dark::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, rgba(59,130,246,.55), rgba(124,58,237,.55));
+    border-radius: 9999px; border: 2px solid transparent; background-clip: padding-box;
+  }
+  .src-dot { width: 10px; height: 10px; border-radius: 9999px; display: inline-block; }
+  .src-up { background: #4ade80; box-shadow: 0 0 10px rgba(74,222,128,.7); }
+  .src-down { background: #f87171; box-shadow: 0 0 10px rgba(248,113,113,.7); }
+  .src-degraded { background: #fbbf24; box-shadow: 0 0 10px rgba(251,191,36,.7); }
+  .src-unknown { background: #64748b; }
 </style>
 </head>
-<body>
-<div class="container">
-  <h1 class="text-center text-3xl font-bold mb-2" style="color:#1d9bf0">🤖 بوت الإشارات KDRX</h1>
-  <p class="text-center text-sm mb-6" style="color:#8b98a5">تداول ورقي • $100 وهمية • إشارات تلقائية</p>
-  <div id="app"><div class="glass p-8 text-center" style="color:#8b98a5">جاري التحميل...</div></div>
-  <div class="text-center text-xs mt-4" style="color:#8b98a5" id="updated"></div>
+<body class="text-slate-200 min-h-screen">
+<div class="max-w-6xl mx-auto p-4 pb-16">
+
+  <header class="flex items-center justify-between py-4">
+    <div class="flex items-center gap-3">
+      <div class="stat-ic" style="background:linear-gradient(135deg,#2563eb,#7c3aed)"><i data-lucide="bot" class="text-white"></i></div>
+      <div>
+        <h1 class="text-xl font-extrabold">بوت الإشارات KDRX</h1>
+        <div class="flex items-center gap-2 text-xs text-slate-400">
+          <span class="pulse-dot"></span><span>مباشر</span>
+          <span id="sync-hint" class="text-slate-500">—</span>
+        </div>
+      </div>
+    </div>
+    <button id="refresh" class="glass px-4 py-2 text-sm font-bold flex items-center gap-2 hover:bg-white/10" onclick="load()">
+      <i data-lucide="refresh-cw" class="w-4 h-4"></i> تحديث
+    </button>
+  </header>
+
+  <div id="sync-line" class="text-xs text-slate-400 pb-2"></div>
+
+  <div id="dash">
+    <!-- نبض السوق -->
+    <section class="glass px-4 py-3 mb-5 flex items-center gap-4 flex-wrap">
+      <div class="flex items-center gap-2 text-xs text-slate-400 whitespace-nowrap">
+        <i data-lucide="activity" class="w-4 h-4 text-emerald-400"></i> نبض السوق
+      </div>
+      <div id="pulse-coins" class="flex items-center gap-4 flex-wrap text-sm font-bold"></div>
+    </section>
+
+    <!-- البطل: القيمة الإجمالية -->
+    <section class="glass p-6 mb-5 text-center relative overflow-hidden">
+      <div class="text-xs text-slate-400 mb-1 flex items-center justify-center gap-2">
+        <i data-lucide="wallet" class="w-4 h-4"></i> القيمة الإجمالية للمحفظة (حية)
+      </div>
+      <div id="h-equity" class="hero-num text-5xl font-black tracking-tight" dir="ltr">$—</div>
+      <div id="h-pnl" class="mt-2 text-sm font-bold">—</div>
+      <div class="grid grid-cols-3 gap-3 mt-5 text-center">
+        <div><div class="text-[11px] text-slate-500">الرصيد النقدي</div><div id="h-cash" class="font-extrabold" dir="ltr">$—</div></div>
+        <div><div class="text-[11px] text-slate-500">صفقات مفتوحة</div><div id="h-open" class="font-extrabold">—</div></div>
+        <div><div class="text-[11px] text-slate-500">آخر مزامنة</div><div id="h-time" class="font-extrabold text-sm">—</div></div>
+      </div>
+    </section>
+
+    <!-- مؤشرات فرعية -->
+    <section class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-5">
+      <div class="glass p-3 flex items-center gap-3"><div class="stat-ic"><i data-lucide="target" class="text-emerald-400"></i></div><div><div class="text-[11px] text-slate-500">نسبة النجاح</div><div id="s-win" class="font-extrabold text-sm">—</div></div></div>
+      <div class="glass p-3 flex items-center gap-3"><div class="stat-ic"><i data-lucide="trending-up" class="text-sky-400"></i></div><div><div class="text-[11px] text-slate-500">إجمالي P&L</div><div id="s-pnl" class="font-extrabold text-sm" dir="ltr">—</div></div></div>
+      <div class="glass p-3 flex items-center gap-3"><div class="stat-ic"><i data-lucide="layers" class="text-amber-400"></i></div><div><div class="text-[11px] text-slate-500">صفقات مغلقة</div><div id="s-closed" class="font-extrabold text-sm">—</div></div></div>
+      <div class="glass p-3 flex items-center gap-3"><div class="stat-ic"><i data-lucide="check-circle" class="text-emerald-400"></i></div><div><div class="text-[11px] text-slate-500">رابحة</div><div id="s-wins" class="font-extrabold text-sm">—</div></div></div>
+      <div class="glass p-3 flex items-center gap-3"><div class="stat-ic"><i data-lucide="x-circle" class="text-red-400"></i></div><div><div class="text-[11px] text-slate-500">خاسرة</div><div id="s-losses" class="font-extrabold text-sm">—</div></div></div>
+      <div class="glass p-3 flex items-center gap-3"><div class="stat-ic"><i data-lucide="bell-ring" class="text-violet-400"></i></div><div><div class="text-[11px] text-slate-500">إشارات مرسلة</div><div id="s-sig" class="font-extrabold text-sm">—</div></div></div>
+    </section>
+
+    <!-- حالة مصادر البيانات -->
+    <section class="mb-5">
+      <h2 class="font-extrabold mb-3 flex items-center gap-2"><i data-lucide="satellite-dish" class="w-5 h-5 text-sky-400"></i> حالة المصادر <span class="text-[11px] text-slate-500 font-normal">تبديل تلقائي عند السقوط</span></h2>
+      <div id="src-grid" class="grid grid-cols-1 sm:grid-cols-3 gap-3"></div>
+    </section>
+
+    <!-- موارد الخادم -->
+    <section class="mb-5">
+      <h2 class="font-extrabold mb-3 flex items-center gap-2"><i data-lucide="server" class="w-5 h-5 text-amber-400"></i> موارد الخادم <span id="res-upd" class="text-[11px] text-slate-500 font-normal"></span></h2>
+      <div class="glass p-4 grid grid-cols-2 sm:grid-cols-4 gap-4" id="res-grid">
+        <div><div class="text-[11px] text-slate-500 mb-1">المعالج CPU</div><div id="r-cpu" class="font-extrabold text-sm">—</div><div class="bar mt-1"><i id="r-cpu-b" style="width:0%"></i></div></div>
+        <div><div class="text-[11px] text-slate-500 mb-1">الذاكرة RAM</div><div id="r-ram" class="font-extrabold text-sm">—</div><div class="bar mt-1"><i id="r-ram-b" style="width:0%"></i></div></div>
+        <div><div class="text-[11px] text-slate-500 mb-1">القرص</div><div id="r-disk" class="font-extrabold text-sm">—</div><div class="bar mt-1"><i id="r-disk-b" style="width:0%"></i></div></div>
+        <div><div class="text-[11px] text-slate-500 mb-1">الحمل (دقيقة)</div><div id="r-load" class="font-extrabold text-sm">—</div><div class="text-[11px] text-slate-500 mt-1" id="r-cores"></div></div>
+      </div>
+    </section>
+
+    <!-- الصفقات المفتوحة -->
+    <section class="mb-5">
+      <h2 class="font-extrabold mb-3 flex items-center gap-2"><i data-lucide="layers" class="w-5 h-5 text-emerald-400"></i> الصفقات المفتوحة <span id="t-count" class="chip"></span></h2>
+      <div class="flex gap-2 mb-3" id="filter-tabs">
+        <button data-f="all" class="ftab active chip !text-xs !py-1.5 !px-4 font-bold">الكل <span id="fc-all"></span></button>
+        <button data-f="win" class="ftab chip !text-xs !py-1.5 !px-4 font-bold">الرابحة <span id="fc-win" class="pos"></span></button>
+        <button data-f="loss" class="ftab chip !text-xs !py-1.5 !px-4 font-bold">الخاسرة <span id="fc-loss" class="neg"></span></button>
+      </div>
+      <div id="t-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div class="skel h-44"></div><div class="skel h-44"></div><div class="skel h-44"></div>
+      </div>
+    </section>
+
+    <!-- سجل الصفقات المغلقة -->
+    <section class="mb-5">
+      <h2 class="font-extrabold mb-3 flex items-center gap-2"><i data-lucide="archive" class="w-5 h-5 text-sky-400"></i> سجل الصفقات المغلقة <span id="c-count" class="chip"></span></h2>
+      <div class="flex gap-2 mb-3 flex-wrap" id="cfilter-tabs">
+        <button data-cf="today" class="cftab chip !text-xs !py-1.5 !px-4 font-bold">اليوم</button>
+        <button data-cf="week" class="cftab chip !text-xs !py-1.5 !px-4 font-bold">آخر 7 أيام</button>
+        <button data-cf="month" class="cftab chip !text-xs !py-1.5 !px-4 font-bold">آخر 30 يوم</button>
+        <button data-cf="all" class="cftab active chip !text-xs !py-1.5 !px-4 font-bold">الكل</button>
+      </div>
+      <div id="c-note" class="text-[11px] text-slate-500 mb-3 leading-relaxed"></div>
+      <div class="glass p-4 mb-3 grid grid-cols-3 gap-3 text-center">
+        <div><div class="text-[11px] text-slate-500 mb-1">إجمالي الربح / الخسارة</div><div id="c-pnl" class="font-black text-xl" dir="ltr">—</div></div>
+        <div><div class="text-[11px] text-slate-500 mb-1">نسبة النجاح</div><div id="c-win" class="font-extrabold text-xl">—</div></div>
+        <div><div class="text-[11px] text-slate-500 mb-1">صفقات مغلقة</div><div id="c-n" class="font-extrabold text-xl">—</div></div>
+      </div>
+      <div id="c-list" class="space-y-2 scroll-dark p-1 max-h-[50vh] overflow-y-auto">
+        <div class="skel h-16"></div>
+      </div>
+    </section>
+
+    <p class="text-xs text-slate-500 text-center">⚠️ المحفظة وهمية 100% للتجربة — نسبة النجاح تقديرية وليست ضماناً للربح</p>
+  </div>
 </div>
+
 <script>
 const GIST_ID = '4f1a5c34fe3f4e64116510a555887f00';
-let stateData = null;
-let openTab = 'all';
-let closedTab = 'all';
+let S = null, openFilter = 'all', closedFilter = 'all';
 
 async function load() {
   try {
-    const res = await fetch(`https://api.github.com/gists/${GIST_ID}`);
-    const gist = await res.json();
-    const file = gist.files['kdrx-state.json'];
-    stateData = JSON.parse(file.content);
+    const r = await fetch('https://api.github.com/gists/' + GIST_ID);
+    const g = await r.json();
+    S = JSON.parse(g.files['kdrx-state.json'].content);
     render();
-    const dt = new Date(stateData.updated_at);
-    document.getElementById('updated').textContent = 'آخر تحديث: ' + dt.toLocaleString('ar');
     if (window.lucide) lucide.createIcons();
-  } catch (e) {
-    document.getElementById('app').innerHTML = '<div class="glass p-8 text-center" style="color:#8b98a5">تعذر تحميل البيانات. حاول لاحقاً.</div>';
+  } catch(e) {
+    document.getElementById('sync-line').textContent = 'تعذر التحميل — حاول لاحقاً';
   }
 }
 
-function fmtTime(ts) {
-  if (!ts) return '-';
+function fmtT(ts) {
+  if (!ts) return '—';
   const d = new Date(ts * 1000);
-  return d.toLocaleString('ar', {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+  return d.toLocaleString('ar', {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
+}
+function fmtP(x) {
+  if (x == null) return '—';
+  return x >= 1000 ? x.toLocaleString('en', {maximumFractionDigits: 2}) : x >= 1 ? x.toFixed(4) : x.toFixed(6);
 }
 
 function render() {
-  const s = stateData;
-  const w = s.wallet || {};
+  const w = S.wallet || {}, sys = S.system || {}, srcs = S.sources || {};
   const positions = Object.values(w.positions || {});
   const closed = w.closed_trades || [];
-  const sys = s.system || {};
-  const srcs = s.sources || {};
   const pnl = w.total_pnl || 0;
-  const pnlClass = pnl >= 0 ? 'color:#00ba7c' : 'color:#f4212e';
-  const winRate = w.total_trades > 0 ? ((w.wins / w.total_trades) * 100).toFixed(1) : '0';
+  const equity = (w.cash || 0);
 
-  let html = '';
+  // sync line
+  const upd = new Date(S.updated_at);
+  document.getElementById('sync-hint').textContent = 'آخر مزامنة: ' + upd.toLocaleTimeString('ar');
+  document.getElementById('sync-line').textContent = 'آخر تحديث للبيانات: ' + upd.toLocaleString('ar');
 
-  // ===== المحفظة =====
-  html += `<div class="glass p-6 mb-4"><h2 class="text-lg font-bold mb-4" style="color:#ffd400">💰 المحفظة الورقية</h2>
-  <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-    <div class="glass p-4 text-center"><div class="text-xs mb-1" style="color:#8b98a5">الرصيد</div><div class="text-xl font-bold" style="color:#1d9bf0">$${(w.cash||0).toFixed(2)}</div></div>
-    <div class="glass p-4 text-center"><div class="text-xs mb-1" style="color:#8b98a5">البداية</div><div class="text-xl font-bold">$${(w.start||100).toFixed(2)}</div></div>
-    <div class="glass p-4 text-center"><div class="text-xs mb-1" style="color:#8b98a5">إجمالي الربح/الخسارة</div><div class="text-xl font-bold" style="${pnlClass}">$${pnl.toFixed(2)}</div></div>
-    <div class="glass p-4 text-center"><div class="text-xs mb-1" style="color:#8b98a5">صفقات مغلقة</div><div class="text-xl font-bold">${w.total_trades||0}</div></div>
-    <div class="glass p-4 text-center"><div class="text-xs mb-1" style="color:#8b98a5">نسبة النجاح</div><div class="text-xl font-bold">${winRate}%</div></div>
-    <div class="glass p-4 text-center"><div class="text-xs mb-1" style="color:#8b98a5">مراكز مفتوحة</div><div class="text-xl font-bold">${positions.length}</div></div>
-  </div></div>`;
+  // hero
+  const hEq = document.getElementById('h-equity');
+  hEq.textContent = '$' + equity.toFixed(2);
+  hEq.classList.toggle('neg', pnl < 0);
+  const hPnl = document.getElementById('h-pnl');
+  hPnl.innerHTML = pnl >= 0
+    ? '<span class="pos">+$' + pnl.toFixed(2) + '</span>'
+    : '<span class="neg">-$' + Math.abs(pnl).toFixed(2) + '</span>';
+  document.getElementById('h-cash').textContent = '$' + (w.cash || 0).toFixed(2);
+  document.getElementById('h-open').textContent = positions.length;
+  document.getElementById('h-time').textContent = upd.toLocaleTimeString('ar', {hour:'2-digit', minute:'2-digit'});
 
-  // ===== حالة المصادر + موارد الخادم =====
-  html += `<div class="grid md:grid-cols-2 gap-4 mb-4">`;
+  // sub stats
+  const wins = w.wins || 0, total = w.total_trades || 0;
+  const wr = total > 0 ? (wins / total * 100).toFixed(1) + '%' : '—';
+  document.getElementById('s-win').textContent = wr;
+  const sPnl = document.getElementById('s-pnl');
+  sPnl.textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
+  sPnl.className = 'font-extrabold text-sm ' + (pnl >= 0 ? 'pos' : 'neg');
+  document.getElementById('s-closed').textContent = total;
+  document.getElementById('s-wins').textContent = wins;
+  document.getElementById('s-losses').textContent = (w.losses || 0);
+  document.getElementById('s-sig').textContent = w.signals_sent || total;
 
-  // مصادر
-  html += `<div class="glass p-6"><h2 class="text-lg font-bold mb-4" style="color:#ffd400">📡 حالة المصادر</h2>`;
-  const srcNames = {binance:'Binance', dexscreener:'DexScreener', coingecko:'CoinGecko'};
-  ['binance','dexscreener','coingecko'].forEach(k => {
-    const st = (srcs[k]||{}).status || 'unknown';
-    const dot = st==='up'?'dot-up':st==='down'?'dot-down':st==='degraded'?'dot-degraded':'dot-unknown';
-    const label = st==='up'?'متصل ✅':st==='down'?'ساقط ❌':st==='degraded'?'متدهور ⚠️':'غير معروف';
-    const failover = st==='down' ? '<span class="text-xs" style="color:#ffd400"> • تبديل تلقائي ✅</span>' : '';
-    html += `<div class="flex items-center justify-between py-2" style="border-bottom:1px solid rgba(255,255,255,0.05)">
-      <span><span class="source-dot ${dot}"></span>${srcNames[k]}</span>
-      <span class="text-sm">${label}${failover}</span></div>`;
+  // market pulse (from system or static)
+  const pulse = S.pulse || {};
+  const coins = [['BTC', 'Bitcoin ₿'], ['ETH', 'Ethereum'], ['SOL', 'Solana'], ['XRP', 'XRP']];
+  let ph = '';
+  coins.forEach(([k, name]) => {
+    const d = pulse[k] || {};
+    if (d.price) {
+      const chg = d.change_pct || 0;
+      ph += '<span class="flex items-center gap-1.5"><span class="' + (chg >= 0 ? 'pos' : 'neg') + '">' + (chg >= 0 ? '🟢' : '🔴') + '</span>' + name + ': <span dir="ltr">' + fmtP(d.price) + '</span> <span class="' + (chg >= 0 ? 'pos' : 'neg') + '" dir="ltr">' + (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%</span></span>';
+    }
   });
-  html += `</div>`;
+  document.getElementById('pulse-coins').innerHTML = ph || '<span class="text-slate-500 text-xs">يُنشر كل 6 ساعات عبر Telegram</span>';
 
-  // موارد الخادم
-  const cpuC = (sys.cpu_pct||0) > 80 ? '#f4212e' : (sys.cpu_pct||0) > 50 ? '#ffd400' : '#00ba7c';
-  const ramC = (sys.ram_pct||0) > 80 ? '#f4212e' : (sys.ram_pct||0) > 50 ? '#ffd400' : '#00ba7c';
-  const diskC = (sys.disk_pct||0) > 80 ? '#f4212e' : (sys.disk_pct||0) > 50 ? '#ffd400' : '#00ba7c';
-  html += `<div class="glass p-6"><h2 class="text-lg font-bold mb-4" style="color:#ffd400">🖥️ موارد الخادم</h2>`;
-  html += `<div class="mb-3"><div class="flex justify-between text-sm mb-1"><span>المعالج CPU</span><span>${sys.cpu_pct||0}%</span></div><div class="progress-bg"><div class="progress-fill" style="width:${sys.cpu_pct||0}%;background:${cpuC}"></div></div></div>`;
-  html += `<div class="mb-3"><div class="flex justify-between text-sm mb-1"><span>الذاكرة RAM</span><span>${sys.ram_pct||0}% (${sys.ram_used_gb||0}/${sys.ram_total_gb||0}GB)</span></div><div class="progress-bg"><div class="progress-fill" style="width:${sys.ram_pct||0}%;background:${ramC}"></div></div></div>`;
-  html += `<div class="mb-3"><div class="flex justify-between text-sm mb-1"><span>القرص</span><span>${sys.disk_pct||0}%</span></div><div class="progress-bg"><div class="progress-fill" style="width:${sys.disk_pct||0}%;background:${diskC}"></div></div></div>`;
-  html += `<div class="flex justify-between text-sm"><span>الحمل (دقيقة)</span><span class="font-bold">${sys.load_1m||0}</span></div>`;
-  html += `<div class="flex justify-between text-sm mt-1"><span>الأنوية</span><span>${sys.cores||'-'}</span></div>`;
-  html += `</div></div>`;
+  // sources
+  const srcNames = {binance: 'Binance', dexscreener: 'DexScreener', coingecko: 'CoinGecko'};
+  const srcIcons = {binance: 'candlestick-chart', dexscreener: 'search', coingecko: 'coins'};
+  let sh = '';
+  ['binance', 'dexscreener', 'coingecko'].forEach(k => {
+    const st = (srcs[k] || {}).status || 'unknown';
+    const dot = st === 'up' ? 'src-up' : st === 'down' ? 'src-down' : st === 'degraded' ? 'src-degraded' : 'src-unknown';
+    const lbl = st === 'up' ? 'متصل' : st === 'down' ? 'ساقط' : st === 'degraded' ? 'متدهور' : 'غير معروف';
+    const fo = st === 'down' ? '<div class="text-[11px] text-amber-400 mt-1">🔄 تبديل تلقائي نشط</div>' : '';
+    sh += '<div class="glass p-4"><div class="flex items-center gap-3"><div class="stat-ic"><i data-lucide="' + (srcIcons[k] || 'satellite-dish') + '" class="text-sky-400"></i></div><div class="flex-1"><div class="font-bold text-sm flex items-center gap-2"><span class="src-dot ' + dot + '"></span>' + srcNames[k] + '</div><div class="text-[11px] text-slate-500 mt-0.5">' + lbl + '</div>' + fo + '</div></div></div>';
+  });
+  document.getElementById('src-grid').innerHTML = sh;
 
-  // ===== الصفقات المفتوحة =====
-  html += `<div class="glass p-6 mb-4"><div class="flex items-center justify-between mb-4 flex-wrap gap-2">
-    <h2 class="text-lg font-bold" style="color:#ffd400">📊 الصفقات المفتوحة (${positions.length})</h2>
-    <div class="flex gap-2">
-      <button class="tab-btn ${openTab==='all'?'active':''}" onclick="setOpenTab('all')">الكل</button>
-      <button class="tab-btn ${openTab==='win'?'active':''}" onclick="setOpenTab('win')">الرابحة</button>
-      <button class="tab-btn ${openTab==='loss'?'active':''}" onclick="setOpenTab('loss')">الخاسرة</button>
-    </div></div>`;
-  let filtered = positions;
-  // تقدير الربح/الخسارة غير المحقق غير متوفر — نعرض الكل في كل تبويب حالياً
-  if (positions.length === 0) {
-    html += '<p class="text-center py-6" style="color:#8b98a5">لا توجد صفقات مفتوحة حالياً</p>';
-  } else {
-    html += `<div class="overflow-x-auto"><table><tr><th>الزوج</th><th>الاتجاه</th><th>الدخول</th><th>الكمية</th><th>القيمة</th><th>وقف الخسارة</th><th>الأهداف</th><th>القوة</th></tr>`;
-    filtered.forEach(p => {
-      const dir = p.direction === 'long' ? '<span class="badge badge-win">شراء 🟢</span>' : '<span class="badge badge-loss">بيع 🔴</span>';
-      html += `<tr><td><b>${p.symbol}</b></td><td>${dir}</td><td>${p.entry}</td><td>${(p.qty||0).toFixed(6)}</td><td>$${(p.notional||0).toFixed(2)}</td><td>${(p.sl||0).toFixed(2)}</td><td class="text-xs">🎯1: ${(p.tp1||0).toFixed(2)}<br>🎯2: ${(p.tp2||0).toFixed(2)}<br>🎯3: ${(p.tp3||0).toFixed(2)}</td><td>${p.signal_strength||'-'}/100</td></tr>`;
-    });
-    html += `</table></div>`;
-  }
-  html += `</div>`;
+  // server resources
+  const cpu = sys.cpu_pct || 0, ram = sys.ram_pct || 0, disk = sys.disk_pct || 0;
+  document.getElementById('r-cpu').textContent = cpu.toFixed(1) + '%';
+  document.getElementById('r-cpu-b').style.width = Math.min(cpu, 100) + '%';
+  document.getElementById('r-ram').textContent = ram.toFixed(1) + '% (' + (sys.ram_used_gb || 0) + '/' + (sys.ram_total_gb || 0) + 'GB)';
+  document.getElementById('r-ram-b').style.width = Math.min(ram, 100) + '%';
+  document.getElementById('r-disk').textContent = disk.toFixed(1) + '%';
+  document.getElementById('r-disk-b').style.width = Math.min(disk, 100) + '%';
+  document.getElementById('r-load').textContent = sys.load_1m || '—';
+  document.getElementById('r-cores').textContent = (sys.cores || '—') + ' أنوية';
 
-  // ===== سجل الصفقات المغلقة =====
-  html += `<div class="glass p-6 mb-4"><div class="flex items-center justify-between mb-4 flex-wrap gap-2">
-    <h2 class="text-lg font-bold" style="color:#ffd400">📝 سجل الصفقات المغلقة (${closed.length})</h2>
-    <div class="flex gap-2 flex-wrap">
-      <button class="tab-btn ${closedTab==='today'?'active':''}" onclick="setClosedTab('today')">اليوم</button>
-      <button class="tab-btn ${closedTab==='7d'?'active':''}" onclick="setClosedTab('7d')">آخر 7 أيام</button>
-      <button class="tab-btn ${closedTab==='30d'?'active':''}" onclick="setClosedTab('30d')">آخر 30 يوم</button>
-      <button class="tab-btn ${closedTab==='all'?'active':''}" onclick="setClosedTab('all')">الكل</button>
-    </div></div>`;
-  const now = Math.floor(Date.now()/1000);
-  let cFiltered = closed;
-  if (closedTab === 'today') {
-    const startDay = new Date(); startDay.setHours(0,0,0,0);
-    cFiltered = closed.filter(t => (t.closed_at||0) >= startDay.getTime()/1000);
-  } else if (closedTab === '7d') {
-    cFiltered = closed.filter(t => (t.closed_at||0) >= now - 7*86400);
-  } else if (closedTab === '30d') {
-    cFiltered = closed.filter(t => (t.closed_at||0) >= now - 30*86400);
-  }
-  if (closedTab === 'all') {
-    html += `<p class="text-xs mb-3" style="color:#8b98a5">تبويب «الكل» يعرض كل السجلات (${closed.length}) — لا يوجد أي حد للعرض ولا شيء مخفي.</p>`;
-  }
-  if (cFiltered.length === 0) {
-    html += '<p class="text-center py-6" style="color:#8b98a5">لا توجد صفقات مغلقة في هذه الفترة</p>';
-  } else {
-    html += `<div class="overflow-x-auto"><table><tr><th>الزوج</th><th>الاتجاه</th><th>الدخول</th><th>الخروج</th><th>المستثمر</th><th>P&L</th><th>%</th><th>السبب</th><th>التاريخ</th></tr>`;
-    [...cFiltered].reverse().forEach(t => {
-      const win = (t.pnl||0) >= 0;
-      const badge = win ? '<span class="badge badge-win">ربح ✅</span>' : '<span class="badge badge-loss">خسارة ❌</span>';
-      const dir = t.direction === 'long' ? 'شراء 🟢' : 'بيع 🔴';
-      const reasonMap = {'stop_loss':'🛑 وقف الخسارة','take_profit':'🎯 جني الربح','tp1':'🎯 هدف 1','tp2':'🎯 هدف 2','tp3':'🎯 هدف 3','timeout':'⏰ انتهاء المدة','rug':'🚨 انهيار'};
-      const reason = reasonMap[t.reason] || t.reason || '-';
-      html += `<tr><td><b>${t.symbol}</b></td><td>${dir}</td><td>${t.entry}</td><td>${t.exit_price||'-'}</td><td>$${(t.notional||t.invested||0).toFixed(2)}</td><td class="font-bold" style="${win?'color:#00ba7c':'color:#f4212e'}">$${(t.pnl||0).toFixed(2)}</td><td style="${win?'color:#00ba7c':'color:#f4212e'}">${(t.pnl_pct||0).toFixed(1)}%</td><td>${reason} ${badge}</td><td class="text-xs">${fmtTime(t.closed_at)}</td></tr>`;
-    });
-    html += `</table></div>`;
-  }
-  html += `</div>`;
-
-  document.getElementById('app').innerHTML = html;
+  // open trades
+  renderOpen(positions);
+  // closed trades
+  renderClosed(closed);
 }
 
-function setOpenTab(t) { openTab = t; render(); if (window.lucide) lucide.createIcons(); }
-function setClosedTab(t) { closedTab = t; render(); if (window.lucide) lucide.createIcons(); }
+function tradeCard(p) {
+  const dirLong = p.direction === 'long';
+  const badge = dirLong ? '<span class="chip pos">شراء 🟢</span>' : '<span class="chip neg">بيع 🔴</span>';
+  const sym = (p.symbol || '').replace('USDT', '/USDT');
+  return '<div class="glass p-4 trade-card">'
+    + '<div class="flex items-center justify-between mb-2"><b dir="ltr">' + sym + '</b>' + badge + '</div>'
+    + '<div class="grid grid-cols-2 gap-2 text-xs">'
+    + '<div><div class="text-slate-500">الدخول</div><div class="font-bold" dir="ltr">' + fmtP(p.entry) + '</div></div>'
+    + '<div><div class="text-slate-500">الكمية</div><div class="font-bold" dir="ltr">' + (p.qty || 0).toFixed(6) + '</div></div>'
+    + '<div><div class="text-slate-500">القيمة</div><div class="font-bold" dir="ltr">$' + (p.notional || 0).toFixed(2) + '</div></div>'
+    + '<div><div class="text-slate-500">القوة</div><div class="font-bold">' + (p.signal_strength || '—') + '/100</div></div>'
+    + '<div><div class="text-slate-500">وقف الخسارة</div><div class="font-bold neg" dir="ltr">' + fmtP(p.sl) + '</div></div>'
+    + '<div><div class="text-slate-500">الأهداف</div><div class="font-bold pos text-[11px]" dir="ltr">🎯1 ' + fmtP(p.tp1) + '<br>🎯2 ' + fmtP(p.tp2) + '<br>🎯3 ' + fmtP(p.tp3) + '</div></div>'
+    + '</div></div>';
+}
+
+function renderOpen(positions) {
+  document.getElementById('t-count').textContent = positions.length;
+  document.getElementById('fc-all').textContent = '(' + positions.length + ')';
+  // win/loss counts need live price — show all under الكل for now
+  document.getElementById('fc-win').textContent = '';
+  document.getElementById('fc-loss').textContent = '';
+  const grid = document.getElementById('t-grid');
+  let list = positions;
+  // ملاحظة: تصنيف رابحة/خاسرة يحتاج السعر الحي — حالياً الكل يعرض الكل
+  if (list.length === 0) {
+    grid.innerHTML = '<div class="glass p-8 text-center text-slate-500 col-span-full">لا توجد صفقات مفتوحة حالياً</div>';
+    return;
+  }
+  grid.innerHTML = list.map(tradeCard).join('');
+}
+
+function renderClosed(closed) {
+  const now = Math.floor(Date.now() / 1000);
+  let list = closed;
+  if (closedFilter === 'today') {
+    const sd = new Date(); sd.setHours(0, 0, 0, 0);
+    list = closed.filter(t => (t.closed_at || 0) >= sd.getTime() / 1000);
+  } else if (closedFilter === 'week') {
+    list = closed.filter(t => (t.closed_at || 0) >= now - 7 * 86400);
+  } else if (closedFilter === 'month') {
+    list = closed.filter(t => (t.closed_at || 0) >= now - 30 * 86400);
+  }
+  document.getElementById('c-count').textContent = closed.length;
+  // stats for filtered
+  const fpnl = list.reduce((a, t) => a + (t.pnl || 0), 0);
+  const fw = list.filter(t => (t.pnl || 0) >= 0).length;
+  const fwr = list.length > 0 ? (fw / list.length * 100).toFixed(1) + '%' : '—';
+  const cPnl = document.getElementById('c-pnl');
+  cPnl.textContent = (fpnl >= 0 ? '+' : '') + '$' + fpnl.toFixed(2);
+  cPnl.className = 'font-black text-xl ' + (fpnl >= 0 ? 'pos' : 'neg');
+  document.getElementById('c-win').textContent = fwr;
+  document.getElementById('c-n').textContent = list.length;
+  document.getElementById('c-note').textContent = closedFilter === 'all'
+    ? 'تبويب «الكل» يعرض كل السجلات (' + closed.length + ') — لا يوجد أي حد للعرض ولا شيء مخفي.'
+    : 'عرض ' + list.length + ' من أصل ' + closed.length + ' صفقة مغلقة.';
+
+  const box = document.getElementById('c-list');
+  if (list.length === 0) {
+    box.innerHTML = '<div class="glass p-8 text-center text-slate-500">لا توجد صفقات مغلقة في هذه الفترة</div>';
+    return;
+  }
+  const reasonMap = {stop_loss: '🛑 وقف الخسارة', take_profit: '🎯 جني الربح', TP1: '🎯 هدف 1', TP2: '🎯 هدف 2', TP3: '🎯 هدف 3', SL: '🛑 وقف الخسارة', timeout: '⏰ انتهاء المدة'};
+  box.innerHTML = [...list].reverse().map(t => {
+    const win = (t.pnl || 0) >= 0;
+    const sym = (t.symbol || '').replace('USDT', '/USDT');
+    const dir = t.direction === 'long' ? 'شراء 🟢' : 'بيع 🔴';
+    return '<div class="glass p-3 trade-card"><div class="flex items-center justify-between flex-wrap gap-2">'
+      + '<div class="flex items-center gap-2"><b dir="ltr">' + sym + '</b><span class="chip">' + dir + '</span>'
+      + '<span class="chip ' + (win ? 'pos' : 'neg') + '">' + (win ? 'ربح ✅' : 'خسارة ❌') + '</span></div>'
+      + '<div class="text-[11px] text-slate-500">' + fmtT(t.closed_at) + '</div></div>'
+      + '<div class="grid grid-cols-3 sm:grid-cols-6 gap-2 mt-2 text-xs text-center">'
+      + '<div><div class="text-slate-500">الدخول</div><div class="font-bold" dir="ltr">' + fmtP(t.entry) + '</div></div>'
+      + '<div><div class="text-slate-500">الخروج</div><div class="font-bold" dir="ltr">' + fmtP(t.exit_price) + '</div></div>'
+      + '<div><div class="text-slate-500">المستثمر</div><div class="font-bold" dir="ltr">$' + (t.notional || 0).toFixed(2) + '</div></div>'
+      + '<div><div class="text-slate-500">P&L</div><div class="font-bold ' + (win ? 'pos' : 'neg') + '" dir="ltr">$' + (t.pnl || 0).toFixed(2) + '</div></div>'
+      + '<div><div class="text-slate-500">النسبة</div><div class="font-bold ' + (win ? 'pos' : 'neg') + '" dir="ltr">' + (t.pnl_pct || 0).toFixed(1) + '%</div></div>'
+      + '<div><div class="text-slate-500">السبب</div><div class="font-bold">' + (reasonMap[t.reason] || t.reason || '—') + '</div></div>'
+      + '</div></div>';
+  }).join('');
+}
+
+document.getElementById('filter-tabs').addEventListener('click', e => {
+  const b = e.target.closest('[data-f]'); if (!b) return;
+  openFilter = b.dataset.f;
+  document.querySelectorAll('#filter-tabs .ftab').forEach(x => x.classList.toggle('active', x === b));
+  renderOpen(Object.values((S.wallet || {}).positions || {}));
+});
+document.getElementById('cfilter-tabs').addEventListener('click', e => {
+  const b = e.target.closest('[data-cf]'); if (!b) return;
+  closedFilter = b.dataset.cf;
+  document.querySelectorAll('#cfilter-tabs .cftab').forEach(x => x.classList.toggle('active', x === b));
+  renderClosed((S.wallet || {}).closed_trades || []);
+});
 
 load();
 setInterval(load, 60000);
