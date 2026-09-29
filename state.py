@@ -65,22 +65,25 @@ def gist_load():
 
 
 def gist_save(s):
-    """يكتب state.json في الـGist. يعيد (ok, err_detail)."""
+    """يكتب state.json في الـGist. يعيد (ok, err_detail, is_rate_limited).
+    is_rate_limited=True عند HTTP 403/429 — لا تُعِد المحاولة فوراً؛
+    حصة GitHub تتجدد كل ساعة. إعادة المحاولة الفورية تُفاقم المشكلة.
+    """
     gid = os.environ.get("GIST_ID")
     headers = _gist_headers()
     if not gid or not headers:
-        return False, "no_gid_or_token"
+        return False, "no_gid_or_token", False
     try:
         r = requests.patch(
             f"{GIST_API}/{gid}", headers=headers, timeout=15,
             json={"files": {"state.json": {
                 "content": json.dumps(s, ensure_ascii=False)}}})
         if r.status_code == 200:
-            return True, ""
-        return False, f"http_{r.status_code}:{r.text[:200]}"
+            return True, "", False
+        is_rl = r.status_code in (403, 429)
+        return False, f"http_{r.status_code}:{r.text[:200]}", is_rl
     except Exception as e:
-        return False, f"exc_{type(e).__name__}:{str(e)[:200]}"
-
+        return False, f"exc_{type(e).__name__}:{str(e)[:200]}", False
 
 def gist_updated_at():
     """يعيد updated_at للـGist (أو None عند الفشل) —
@@ -225,13 +228,13 @@ def load():
 
 
 def save(s):
-    """يحفظ الحالة محلياً وفي الـGist. يعيد (ok, err_detail)."""
+    """يحفظ الحالة محلياً وفي الـGist. يعيد (ok, err_detail, is_rate_limited)."""
     if not _assert_no_secrets(s):
-        return False, "forbidden_keys"  # fail-closed: لا نحفظ أسراراً في الـGist العام أبداً
+        return False, "forbidden_keys", False  # fail-closed: لا نحفظ أسراراً في الـGist العام أبداً
     s = _prune(s)
     _file_save(s)   # محلي (للـcache)
-    ok, err = gist_save(s)    # سحابي (الأساسي — best effort)
-    return ok, err
+    return gist_save(s)    # سحابي (الأساسي — best effort)
+
 
 
 # ---------- ذاكرة الخبير: نتائج الإشارات السابقة ----------
