@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 
 import config
-from scanner import scan_all
+from scanner import scan_all, fetch_market_pulse
 from wallet import PaperWallet
 from executor import Executor
 import publisher
@@ -102,6 +102,19 @@ def run_cycle():
             state["last_summary"] = today
             save_signals_state(state)
             log.info("Published daily summary")
+
+    # 5b. نبض السوق (كل 6 ساعات)
+    last_pulse = state.get("last_pulse", 0)
+    if time.time() - last_pulse > 6 * 3600:
+        try:
+            pulse = fetch_market_pulse()
+            if pulse:
+                publisher.publish_market_pulse(pulse)
+                state["last_pulse"] = int(time.time())
+                save_signals_state(state)
+                log.info("Published market pulse")
+        except Exception as e:
+            log.warning(f"Market pulse failed: {e}")
 
     log.info(f"=== Cycle end: equity=${wallet.equity():.2f} ===")
     

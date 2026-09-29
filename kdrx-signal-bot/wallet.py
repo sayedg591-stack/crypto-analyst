@@ -119,6 +119,7 @@ class PaperWallet:
             "pos_id": pos_id, "symbol": pos["symbol"],
             "pct": pct, "price": price, "pnl": round(pnl, 4),
             "reason": reason, "at": int(time.time()),
+            "entry": pos["entry"], "direction": pos["direction"],
         }
         if pos["remaining_pct"] <= 0.001:
             pos["status"] = "closed"

@@ -43,16 +43,12 @@ def signal_message(sig, position=None):
     """رسالة إشارة جديدة بصيغة Kdrx."""
     direction_ar = "شراء 🟢" if sig["direction"] == "long" else "بيع 🔴"
     pair = sig["symbol"].replace("USDT", "/USDT")
+    emoji = "🟢" if sig["direction"] == "long" else "🔴"
     lines = [
-        "📊 <b>إشارة جديدة</b>",
+        f"{emoji} <b>صفقة {direction_ar.split()[0]} جديدة — {pair} سبوت · فريم 4 ساعات</b>",
         "",
-        f"الزوج: <b>{pair}</b>",
-        f"الاتجاه: <b>{direction_ar}</b>",
-        f"الفريم: <b>{sig['timeframe']}</b>",
-        f"النوع: <b>سبوت</b>",
         f"قوة الإشارة: <b>{sig['strength']}/100</b>",
         f"المخاطرة/العائد: <b>{sig['rr']}</b>",
-        f"حجم المخاطرة: <b>{sig['risk_pct']}%</b>",
         "",
         f"الدخول: <code>{_fmt_price(sig['entry'])}</code>",
         f"وقف الخسارة: <code>{_fmt_price(sig['sl'])}</code>",
@@ -70,14 +66,30 @@ def signal_message(sig, position=None):
 
 
 def event_message(event):
-    """رسالة حدث (TP/SL)."""
+    """رسالة حدث (TP/SL) بصيغة Kdrx."""
     sym = event["symbol"].replace("USDT", "/USDT")
     pnl = event["pnl"]
+
+    # صيغة Kdrx الخاصة للهدف الأول
+    if event["reason"] == "TP1":
+        entry = event.get("entry", 0)
+        target = event.get("price", 0)
+        profit_pct = ((target - entry) / entry * 100) if entry else 0
+        if event.get("direction") == "short":
+            profit_pct = -profit_pct
+        return (
+            f"✅ <b>{sym} — تحقّق الهدف الأول</b>\n"
+            f"الدخول {_fmt_price(entry)} ← الهدف {_fmt_price(target)}\n"
+            f"الربح: <b>{profit_pct:+.1f}%</b>\n"
+            f"\n"
+            f"بيع 50% وتحريك وقف الخسارة إلى نقطة الدخول —\n"
+            f"الصفقة صارت <b>بلا مخاطرة</b> ✅"
+        )
+
     pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
     emoji = "✅" if pnl >= 0 else "🛑"
 
     reason_ar = {
-        "TP1": "الهدف الأول 🎯 (+ نقل الوقف للتعادل)",
         "TP2": "الهدف الثاني 🎯🎯",
         "TP3": "الهدف الثالث 🎯🎯🎯 (إغلاق كامل)",
         "SL": "وقف الخسارة 🛑",
@@ -126,3 +138,27 @@ def publish_startup():
         "الوضع: <b>paper trading</b> (محفظة وهمية $100)\n"
         "الفريم: <b>4 ساعات</b> | الفحص كل <b>15 دقيقة</b>"
     )
+
+
+def market_pulse_message(prices):
+    """نبض السوق بصيغة Kdrx: أسعار العملات الرئيسية مع التغير."""
+    coins = [
+        ("Bitcoin", "BTCUSDT"),
+        ("Ethereum", "ETHUSDT"),
+        ("Solana", "SOLUSDT"),
+        ("XRP", "XRPUSDT"),
+    ]
+    lines = ["📈 <b>نبض السوق</b>", ""]
+    for name, sym in coins:
+        data = prices.get(sym, {})
+        price = data.get("price", 0)
+        change = data.get("change_pct", 0)
+        emoji = "🟢" if change >= 0 else "🔴"
+        sign = "+" if change >= 0 else ""
+        lines.append(f"{emoji} {name}: {_fmt_price(price)} {sign}{change:.2f}%")
+    lines += ["", "هل تريد معرفة أيها في منطقة شراء؟ حلّله في ثوانٍ."]
+    return "\n".join(lines)
+
+
+def publish_market_pulse(prices):
+    return _send(market_pulse_message(prices))

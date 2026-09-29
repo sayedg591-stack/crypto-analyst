@@ -43,6 +43,45 @@ def fetch_price(symbol):
     return float(df["close"].iloc[-1])
 
 
+def fetch_market_pulse():
+    """جلب أسعار العملات الرئيسية مع تغير 24 ساعة (نبض السوق)."""
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+    result = {}
+    try:
+        r = requests.get(
+            config.TICKER_ENDPOINT,
+            params={"symbols": str(symbols).replace("'", '"')},
+            timeout=15,
+        )
+        # Binance API يقبل symbols كمصفوفة JSON
+        if r.status_code == 400:
+            # fallback: طلب واحد واحد
+            for sym in symbols:
+                try:
+                    rr = requests.get(config.TICKER_ENDPOINT, params={"symbol": sym}, timeout=10)
+                    if rr.status_code == 200:
+                        d = rr.json()
+                        result[sym] = {
+                            "price": float(d.get("lastPrice", 0)),
+                            "change_pct": float(d.get("priceChangePercent", 0)),
+                        }
+                    time.sleep(0.2)
+                except Exception:
+                    pass
+            return result
+        r.raise_for_status()
+        for d in r.json():
+            sym = d.get("symbol")
+            if sym in symbols:
+                result[sym] = {
+                    "price": float(d.get("lastPrice", 0)),
+                    "change_pct": float(d.get("priceChangePercent", 0)),
+                }
+    except Exception as e:
+        print(f"[SCANNER] market pulse failed: {e}", flush=True)
+    return result
+
+
 # ================= المؤشرات (تطبيق يدوي — بدون مكتبات خارجية) =================
 
 def rsi(series, period=None):
