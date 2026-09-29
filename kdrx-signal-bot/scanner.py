@@ -170,6 +170,80 @@ def compute_indicators(df):
     return df
 
 
+# ================= الدعم والمقاومة (طريقة Kdrx: الدخول قرب الدعم) =================
+
+def find_support_resistance(df, lookback=None):
+    """إيجاد أقرب دعم ومقاومة من القيعان/القمم المحلية."""
+    lookback = lookback or config.SUPPORT_LOOKBACK
+    recent = df.tail(lookback)
+    price = float(df["close"].iloc[-2])  # آخر سعر مغلق
+
+    # القيعان المحلية (دعم): low أقل من الجيران
+    lows = recent["low"]
+    supports = []
+    for i in range(2, len(lows) - 2):
+        if lows.iloc[i] < lows.iloc[i-1] and lows.iloc[i] < lows.iloc[i+1] \
+           and lows.iloc[i] < lows.iloc[i-2] and lows.iloc[i] < lows.iloc[i+2]:
+            supports.append(float(lows.iloc[i]))
+
+    # القمم المحلية (مقاومة)
+    highs = recent["high"]
+    resistances = []
+    for i in range(2, len(highs) - 2):
+        if highs.iloc[i] > highs.iloc[i-1] and highs.iloc[i] > highs.iloc[i+1] \
+           and highs.iloc[i] > highs.iloc[i-2] and highs.iloc[i] > highs.iloc[i+2]:
+            resistances.append(float(highs.iloc[i]))
+
+    # أقرب دعم تحت السعر، أقرب مقاومة فوق السعر
+    support = max([s for s in supports if s < price], default=None)
+    resistance = min([r for r in resistances if r > price], default=None)
+    return support, resistance
+
+
+def is_near_support(price, support):
+    """هل السعر قريب من الدعم (ضمن النسبة المحددة)؟"""
+    if support is None or support <= 0:
+        return False
+    return abs(price - support) / support <= config.SUPPORT_PROXIMITY_PCT
+
+
+def is_near_resistance(price, resistance):
+    """هل السعر قريب من المقاومة؟"""
+    if resistance is None or resistance <= 0:
+        return False
+    return abs(price - resistance) / resistance <= config.SUPPORT_PROXIMITY_PCT
+
+
+def risk_level(strength):
+    """مستوى المخاطرة مثل Kdrx: قوة عالية = مخاطرة منخفضة."""
+    if strength >= 80:
+        return "منخفضة", "🟢"
+    elif strength >= 65:
+        return "متوسطة", "🟡"
+    else:
+        return "مرتفعة", "🔴"
+
+
+def build_analysis_text(direction, rsi_val, support, resistance, vol_ratio, entry):
+    """نص التحليل مثل Kdrx: الاتجاه + مؤشر القوة + الدعم + الحجم."""
+    trend = "صاعد" if direction == "long" else "هابط"
+    parts = [f"الاتجاه {trend} ومؤشر القوة {rsi_val:.0f}"]
+    if direction == "long" and support:
+        parts.append(f"والسعر قريب من دعم عند {_fmt(support)}")
+    elif direction == "short" and resistance:
+        parts.append(f"والسعر قريب من مقاومة عند {_fmt(resistance)}")
+    parts.append(f"حجم التداول ×{vol_ratio:.2f} المعدل.")
+    return "📌 " + "، ".join(parts)
+
+
+def _fmt(x):
+    if x >= 1000:
+        return f"{x:,.2f}"
+    if x >= 1:
+        return f"{x:.4f}"
+    return f"{x:.6f}"
+
+
 # ================= التقييم (0-100) =================
 
 def score_row(row, prev):
@@ -283,13 +357,21 @@ def build_signal(symbol, df):
 
     strength, direction, details, _ = score_row(row, prev)
 
-    # البوابة: نقاط ≥ 72 و ADX > 20
+    # البوابة: نقاط ≥ 55 و ADX > 20
     if direction == "neutral" or strength < config.MIN_SCORE:
         return None
     if row["adx"] < config.MIN_ADX:
         return None
 
     entry = float(row["close"])
+
+    # فلتر Kdrx: الدخول قرب الدعم (شراء) أو قرب المقاومة (بيع)
+    support, resistance = find_support_resistance(df)
+    if direction == "long" and not is_near_support(entry, support):
+        return None  # السعر بعيد عن الدعم — ليست صفقة Kdrx
+    if direction == "short" and not is_near_resistance(entry, resistance):
+        return None
+
     atr_val = float(row["atr"])
     sl_dist = atr_val * config.ATR_SL_MULT
 
@@ -304,8 +386,14 @@ def build_signal(symbol, df):
         tp2 = entry - sl_dist * config.TP_MULTIPLES[1]
         tp3 = entry - sl_dist * config.TP_MULTIPLES[2]
 
-    rr = round(sl_dist * config.TP_MULTIPLES[0] / sl_dist, 2)  # = 1.5
+    rr = round(sl_dist * config.TP_MULTIPLES[0] / sl_dist, 2)  # = 2.0 (مثل Kdrx)
     risk_pct = round(sl_dist / entry * 100, 2)
+
+    # حقول Kdrx الإضافية
+    risk_lbl, risk_emoji = risk_level(strength)
+    rsi_val = float(row["rsi"]) if pd.notna(row["rsi"]) else 50
+    vol_r = float(row["vol_ratio"]) if pd.notna(row["vol_ratio"]) else 1.0
+    analysis = build_analysis_text(direction, rsi_val, support, resistance, vol_r, entry)
 
     return {
         "symbol": symbol,
@@ -318,13 +406,21 @@ def build_signal(symbol, df):
         "tp1": round(tp1, 6),
         "tp2": round(tp2, 6),
         "tp3": round(tp3, 6),
-        "rr": f"{rr}:1",
+        "rr": f"{rr:.0f} : 1",
         "risk_pct": risk_pct,
         "adx": round(float(row["adx"]), 1),
         "atr": round(atr_val, 6),
         "details": details,
         "candle_time": int(df["open_time"].iloc[-2]),
         "created_at": int(time.time()),
+        # حقول Kdrx
+        "risk_level": risk_lbl,
+        "risk_emoji": risk_emoji,
+        "rsi_value": round(rsi_val, 0),
+        "support": round(support, 6) if support else None,
+        "resistance": round(resistance, 6) if resistance else None,
+        "vol_ratio": round(vol_r, 2),
+        "analysis": analysis,
     }
 
 

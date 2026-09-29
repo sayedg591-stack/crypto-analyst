@@ -40,21 +40,30 @@ def _fmt_price(x):
 
 
 def signal_message(sig, position=None):
-    """رسالة إشارة جديدة بصيغة Kdrx."""
-    direction_ar = "شراء 🟢" if sig["direction"] == "long" else "بيع 🔴"
+    """رسالة إشارة جديدة بصيغة Kdrx الأصلية 100%."""
+    direction_ar = "شراء" if sig["direction"] == "long" else "بيع"
     pair = sig["symbol"].replace("USDT", "/USDT")
     emoji = "🟢" if sig["direction"] == "long" else "🔴"
+    risk_emoji = sig.get("risk_emoji", "🟡")
+    risk_lbl = sig.get("risk_level", "متوسطة")
+
     lines = [
-        f"{emoji} <b>صفقة {direction_ar.split()[0]} جديدة — {pair} سبوت · فريم 4 ساعات</b>",
+        f"{emoji} <b>صفقة {direction_ar} جديدة — {pair}</b>",
+        f"سبوت · فريم 4 ساعات · {risk_emoji} مخاطرة {risk_lbl}",
         "",
-        f"قوة الإشارة: <b>{sig['strength']}/100</b>",
-        f"المخاطرة/العائد: <b>{sig['rr']}</b>",
+        f"💪 قوة الإشارة <b>{sig['strength']}/100</b>",
+        f"⚖️ المخاطرة/العائد <b>{sig['rr']}</b>",
+        f"🛡️ حجم المخاطرة <b>{sig['risk_pct']}%</b>",
         "",
         f"الدخول: <code>{_fmt_price(sig['entry'])}</code>",
         f"وقف الخسارة: <code>{_fmt_price(sig['sl'])}</code>",
         f"الهدف 1: <code>{_fmt_price(sig['tp1'])}</code>",
         f"الهدف 2: <code>{_fmt_price(sig['tp2'])}</code>",
         f"الهدف 3: <code>{_fmt_price(sig['tp3'])}</code>",
+        "",
+        sig.get("analysis", ""),
+        "",
+        "تحليل تقني آلي — سبوت فقط، بلا رافعة. ليست نصيحة استثمارية.",
     ]
     if position:
         lines += [
@@ -87,12 +96,26 @@ def event_message(event):
         )
 
     pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+
+    # صيغة Kdrx الخاصة لوقف الخسارة
+    if event["reason"] == "SL":
+        entry = event.get("entry", 0)
+        loss_pct = ((event.get("price", 0) - entry) / entry * 100) if entry else 0
+        if event.get("direction") == "short":
+            loss_pct = -loss_pct
+        return (
+            f"🛑 <b>{sym} — ضرب وقف الخسارة</b>\n"
+            f"النتيجة: <b>{loss_pct:.2f}%</b> · الدخول كان {_fmt_price(entry)}\n"
+            f"\n"
+            f"الخسارة جزء من العمل. وقف الخسارة حماك من خسارة أكبر —\n"
+            f"وهذا دوره بالضبط. ننشر كل النتائج، الرابحة والخاسرة."
+        )
+
     emoji = "✅" if pnl >= 0 else "🛑"
 
     reason_ar = {
         "TP2": "الهدف الثاني 🎯🎯",
         "TP3": "الهدف الثالث 🎯🎯🎯 (إغلاق كامل)",
-        "SL": "وقف الخسارة 🛑",
     }.get(event["reason"], event["reason"])
 
     pct = int(event["pct"] * 100)
