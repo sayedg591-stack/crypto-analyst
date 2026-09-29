@@ -425,7 +425,37 @@ def build_signal(symbol, df):
 
 
 def scan_all():
-    """فحص كل العملات → قائمة الإشارات."""
+    """فحص كل العملات بشكل متوازي (سريع) → قائمة الإشارات."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    signals = []
+
+    def scan_one(symbol):
+        try:
+            df = fetch_klines(symbol)
+            if df is None:
+                return None
+            sig = build_signal(symbol, df)
+            if sig:
+                print(f"[SCANNER] SIGNAL {symbol} {sig['direction']} strength={sig['strength']}", flush=True)
+            return sig
+        except Exception as e:
+            print(f"[SCANNER] error {symbol}: {e}", flush=True)
+            return None
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=config.SCAN_WORKERS) as ex:
+        futures = {ex.submit(scan_one, s): s for s in config.WATCHLIST}
+        for f in as_completed(futures):
+            sig = f.result()
+            if sig:
+                signals.append(sig)
+    dt = time.time() - t0
+    print(f"[SCANNER] Scanned {len(config.WATCHLIST)} pairs in {dt:.1f}s → {len(signals)} signals", flush=True)
+    return signals
+
+
+def scan_all_sequential():
+    """فحص تسلسلي (احتياطي)."""
     signals = []
     for symbol in config.WATCHLIST:
         df = fetch_klines(symbol)
@@ -435,7 +465,7 @@ def scan_all():
         if sig:
             signals.append(sig)
             print(f"[SCANNER] SIGNAL {symbol} {sig['direction']} strength={sig['strength']}", flush=True)
-        time.sleep(0.2)  # احترام rate limit
+        time.sleep(0.2)
     return signals
 
 
