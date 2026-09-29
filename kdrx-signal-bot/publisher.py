@@ -6,29 +6,36 @@ import requests
 import config
 
 
-def _send(text):
-    """إرسال رسالة Telegram. يُرجع True عند النجاح."""
+def _send(text, reply_to=None):
+    """إرسال رسالة Telegram. يُرجع message_id عند النجاح (للاقتباس reply)."""
     if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
         print("[PUB] Telegram not configured — skipping send", flush=True)
         print(f"[PUB] Would send:\n{text}\n", flush=True)
-        return False
+        return None
     try:
+        payload = {
+            "chat_id": config.TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+        }
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
         r = requests.post(
             f"{config.TELEGRAM_API}/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": config.TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": "HTML",
-            },
+            json=payload,
             timeout=15,
         )
         ok = r.status_code == 200
         if not ok:
             print(f"[PUB] Telegram failed: {r.status_code} {r.text[:200]}", flush=True)
-        return ok
+            return None
+        try:
+            return r.json()["result"]["message_id"]
+        except Exception:
+            return None
     except Exception as e:
         print(f"[PUB] Telegram error: {e}", flush=True)
-        return False
+        return None
 
 
 def _fmt_price(x):
@@ -144,11 +151,13 @@ def summary_message(stats):
 
 
 def publish_signal(sig, position=None):
+    """يُرجع message_id لاستخدامه في الاقتباس (reply) عند TP/SL."""
     return _send(signal_message(sig, position))
 
 
-def publish_event(event):
-    return _send(event_message(event))
+def publish_event(event, reply_to=None):
+    """رسالة حدث تقتبس الإشارة الأصلية (مثل Kdrx)."""
+    return _send(event_message(event), reply_to=reply_to)
 
 
 def publish_summary(stats):
@@ -159,7 +168,7 @@ def publish_startup():
     return _send(
         "🤖 <b>بوت الإشارات بدأ العمل</b>\n"
         "الوضع: <b>paper trading</b> (محفظة وهمية $100)\n"
-        "الفريم: <b>4 ساعات</b> | الفحص كل <b>15 دقيقة</b>"
+        "الفريم: <b>4 ساعات</b> | الفحص كل <b>5 دقائق</b> | المراقبة كل <b>دقيقتين</b>"
     )
 
 
