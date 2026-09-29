@@ -119,6 +119,19 @@ def run_monitor_only():
         except Exception as e:
             log.warning(f"Market pulse failed: {e}")
 
+    # حصيلة الأسبوع (مثل Kdrx) — مرة كل 7 أيام
+    if time.time() - int(state.get("last_weekly", 0)) > 7 * 24 * 3600:
+        try:
+            week_ago = time.time() - 7 * 24 * 3600
+            recent = [t for t in wallet.data.get("closed_trades", [])
+                      if t.get("closed_at", 0) >= week_ago]
+            publisher.publish_weekly_rollup(recent)
+            state["last_weekly"] = int(time.time())
+            save_signals_state(state)
+            log.info("Published weekly rollup")
+        except Exception as e:
+            log.warning(f"Weekly rollup failed: {e}")
+
     dt = time.time() - t0
     log.info(f"=== Monitor cycle end: {dt:.1f}s, {len(events)} events, equity=${wallet.equity():.2f} ===")
     publish_gist(wallet)
