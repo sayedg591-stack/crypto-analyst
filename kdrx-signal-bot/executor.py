@@ -34,19 +34,25 @@ class Executor:
     # ---------- مراقبة المراكز المفتوحة ----------
 
     def check_positions(self):
-        """فحص كل مركز مفتوح مقابل السعر الحالي → أحداث TP/SL."""
+        """فحص كل مركز مفتوح مقابل السعر الحالي (متوازي وسريع) → أحداث TP/SL."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         events = []
         open_pos = self.wallet.open_positions()
         if not open_pos:
             return events
 
-        # جلب الأسعار (طلب واحد لكل رمز)
+        # جلب الأسعار بشكل متوازي
+        def get_price(sym):
+            try:
+                return sym, fetch_price(sym)
+            except Exception:
+                return sym, None
+
+        symbols = list(set(p["symbol"] for p in open_pos.values()))
         prices = {}
-        for pid, p in open_pos.items():
-            sym = p["symbol"]
-            if sym not in prices:
-                prices[sym] = fetch_price(sym)
-                time.sleep(0.15)
+        with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as ex:
+            for sym, price in ex.map(lambda s: (s, fetch_price(s)), symbols):
+                prices[sym] = price
 
         for pid, p in open_pos.items():
             price = prices.get(p["symbol"])
