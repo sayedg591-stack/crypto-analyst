@@ -8,7 +8,7 @@ BINANCE_API = "https://data-api.binance.vision"
 KLINES_ENDPOINT = f"{BINANCE_API}/api/v3/klines"
 TICKER_ENDPOINT = f"{BINANCE_API}/api/v3/ticker/24hr"
 
-# ---------- قائمة العملات (Top 30 USDT spot) ----------
+# ---------- قائمة العملات (Top 50 USDT spot — سيولة عالية) ----------
 WATCHLIST = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
     "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
@@ -16,10 +16,19 @@ WATCHLIST = [
     "APTUSDT", "ARBUSDT", "OPUSDT", "INJUSDT", "SUIUSDT",
     "FILUSDT", "AAVEUSDT", "GRTUSDT", "SANDUSDT", "MANAUSDT",
     "AXSUSDT", "THETAUSDT", "VETUSDT", "ALGOUSDT", "FTMUSDT",
+    "TRXUSDT", "ETCUSDT", "XLMUSDT", "HBARUSDT", "BONKUSDT",
+    "SHIBUSDT", "PEPEUSDT", "WLDUSDT", "SEIUSDT", "TIAUSDT",
+    "JUPUSDT", "ONDOUSDT", "FETUSDT", "RENDERUSDT", "ARUSDT",
+    "DASHUSDT", "ZECUSDT", "EGLDUSDT", "TONUSDT", "NEIROUSDT",
 ]
 
 TIMEFRAME = "4h"
 KLINE_LIMIT = 200  # عدد الشموع لكل طلب (كافٍ لحساب كل المؤشرات)
+
+# ---------- السرعة (استغلال كامل للـVM — مجاني 100%) ----------
+SCAN_WORKERS = 8          # عدد الخيوط المتوازية للفحص
+SCAN_INTERVAL_MINUTES = 5  # فحص الإشارات كل 5 دقائق
+MONITOR_INTERVAL_MINUTES = 2  # مراقبة المراكز (TP/SL) كل دقيقتين
 
 # ---------- بوابة الإشارة ----------
 MIN_SCORE = 55        # الحد الأدنى لقوة الإشارة (من 100) — معاير على بيانات حية
@@ -59,7 +68,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_API = "https://api.telegram.org"
 
 # ---------- التشغيل ----------
-SCAN_INTERVAL_MINUTES = 15
 STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
 WALLET_FILE = os.path.join(STATE_DIR, "wallet.json")
 SIGNALS_FILE = os.path.join(STATE_DIR, "signals.json")
