@@ -23,7 +23,7 @@ jobs:
           python3 - <<'PYEOF'
           import datetime, json, os, sys, time, urllib.parse, urllib.request
 
-          GIST_ID = "7181de8f94858379915d85d0a04bcbef"
+          GIST_ID = "4f1a5c34fe3f4e64116510a555887f00"
           STALE_AFTER_MIN = 30    # نعتبر البوت متوقفاً بعد 30 دقيقة بلا تحديث
           CHECK_EVERY_MIN = 15    # دورية هذا الفحص
           REMIND_EVERY_MIN = 120  # تذكير كل ساعتين أثناء استمرار التوقف
