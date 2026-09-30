@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""مستمع Telegram: 📊 حلّل أصلك الآن — تحليل فوري لأي عملة عند الطلب (مثل Kdrx)."""
+"""مستمع Telegram: 📊 حلّل أصلك الآن — تحليل فوري لأي عملة عند الطلب (مثل Kdrx).
+
+يعمل كـ daemon عبر cron كل دقيقة مع flock (يُعيد التشغيل تلقائياً عند السقوط).
+يستجيب فقط لصاحب البوت (TELEGRAM_CHAT_ID) — يتجاهل أي شخص آخر بصمت.
+"""
 
 import json
 import logging
@@ -29,6 +33,7 @@ log = logging.getLogger("listener")
 OFFSET_FILE = os.path.join(config.STATE_DIR, "listener_offset.txt")
 API = f"{config.TELEGRAM_API}/bot{config.TELEGRAM_BOT_TOKEN}"
 
+# أسماء عربية شائعة → رمز
 AR_ALIASES = {
     "بتكوين": "BTCUSDT", "بيتكوين": "BTCUSDT", "البتكوين": "BTCUSDT",
     "إيثيريوم": "ETHUSDT", "الايثيريوم": "ETHUSDT", "ايثيريوم": "ETHUSDT",
@@ -43,12 +48,15 @@ AR_ALIASES = {
     "أفاكس": "AVAXUSDT", "يونيسواب": "UNIUSDT",
 }
 
-_last_reply = {}
+_last_reply = {}  # chat_id → timestamp (منع الإغراق)
 
 
 def tg(method, **params):
+    # getUpdates uses long-polling (Telegram waits up to `timeout` seconds),
+    # so the HTTP timeout must exceed it — otherwise every poll times out.
+    http_timeout = 70 if method == "getUpdates" else 20
     try:
-        r = requests.post(f"{API}/{method}", json=params, timeout=20)
+        r = requests.post(f"{API}/{method}", json=params, timeout=http_timeout)
         if r.status_code == 200:
             return r.json().get("result")
         log.warning(f"tg {method} failed: {r.status_code} {r.text[:150]}")
@@ -80,9 +88,11 @@ def save_offset(offset):
 
 
 def parse_symbol(text):
+    """تحويل نص المستخدم إلى رمز Binance مثل BTCUSDT."""
     t = text.strip()
     if t in AR_ALIASES:
         return AR_ALIASES[t]
+    # إزالة المسافات والشرطات: "ETH / USDT" → "ETHUSDT"
     t = re.sub(r"[\s\-/_]+", "", t).upper()
     t = re.sub(r"[^A-Z0-9]", "", t)
     if not t:
@@ -113,9 +123,11 @@ def help_text():
 def handle(chat_id, text, msg_id):
     t = text.strip()
     low = t.lower()
+
     if low in ("/start", "مساعدة", "مساعده", "help", "؟", "?"):
         send(chat_id, help_text(), reply_to=msg_id)
         return
+
     if low in ("نبض", "النبض", "/pulse", "pulse"):
         pulse = fetch_market_pulse()
         if pulse:
@@ -123,28 +135,35 @@ def handle(chat_id, text, msg_id):
         else:
             send(chat_id, "⚠️ تعذّر جلب نبض السوق الآن.", reply_to=msg_id)
         return
+
     if low in ("محفظة", "المحفظة", "رصيد", "الرصيد", "/wallet", "wallet"):
         w = PaperWallet()
         send(chat_id, publisher.summary_message(w.stats()), reply_to=msg_id)
         return
+
+    # منع الإغراق: تحليل واحد كل 5 ثوانٍ
     now = time.time()
     if now - _last_reply.get(chat_id, 0) < 5:
         return
     _last_reply[chat_id] = now
+
     symbol = parse_symbol(t)
     if not symbol:
         send(chat_id, "⚠️ لم أفهم العملة. مثال: <code>BTC</code> أو <code>سولانا</code>", reply_to=msg_id)
         return
+
+    # تحقق سريع من وجود الزوج
     if fetch_klines(symbol, limit=2) is None:
         send(chat_id, f"⚠️ الزوج <code>{symbol}</code> غير موجود على Binance.", reply_to=msg_id)
         return
+
     send(chat_id, f"⏳ جارٍ تحليل <b>{symbol.replace('USDT', '/USDT')}</b>...", reply_to=msg_id)
     a = analyze_asset(symbol)
     if not a:
         send(chat_id, "⚠️ تعذّر التحليل (بيانات ناقصة).", reply_to=msg_id)
         return
     publisher.publish_analysis(a, reply_to=msg_id)
-    log.info(f"Analyzed {symbol}: {a['direction']} {a['strength']}")
+    log.info(f"Analyzed {symbol}: {a['direction']} {a['strength']} → {a['verdict']}")
 
 
 def main():
@@ -153,13 +172,16 @@ def main():
         return
     me = tg("getMe")
     log.info(f"Listener started as @{me.get('username') if me else '?'}")
+
     offset = load_offset()
     if offset == 0:
+        # عند أول تشغيل: تجاهل الرسائل القديمة
         updates = tg("getUpdates", timeout=5)
         if updates:
             offset = max(u["update_id"] for u in updates) + 1
             save_offset(offset)
             log.info(f"Skipped history, offset={offset}")
+
     my_chat = str(config.TELEGRAM_CHAT_ID)
     while True:
         try:
@@ -172,7 +194,7 @@ def main():
                 chat_id = str(msg.get("chat", {}).get("id", ""))
                 text = msg.get("text", "")
                 if not text or chat_id != my_chat:
-                    continue
+                    continue  # تجاهل أي شخص آخر + الرسائل غير النصية
                 log.info(f"Message from owner: {text[:60]}")
                 try:
                     handle(chat_id, text, msg.get("message_id"))
