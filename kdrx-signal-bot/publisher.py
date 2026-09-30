@@ -54,6 +54,11 @@ def signal_message(sig, position=None):
     risk_emoji = sig.get("risk_emoji", "🟡")
     risk_lbl = sig.get("risk_level", "متوسطة")
 
+    entry_line = f"الدخول: <code>{_fmt_price(sig['entry'])}</code>"
+    zone = sig.get("entry_zone")
+    if zone:
+        entry_line += f" (منطقة {_fmt_price(zone[0])} – {_fmt_price(zone[1])})"
+
     lines = [
         f"{emoji} <b>صفقة {direction_ar} جديدة — {pair}</b>",
         f"سبوت · فريم 4 ساعات · {risk_emoji} مخاطرة {risk_lbl}",
@@ -62,8 +67,8 @@ def signal_message(sig, position=None):
         f"⚖️ المخاطرة/العائد <b>{sig['rr']}</b>",
         f"🛡️ حجم المخاطرة <b>{sig['risk_pct']}%</b>",
         "",
-        f"الدخول: <code>{_fmt_price(sig['entry'])}</code>",
-        f"وقف الخسارة: <code>{_fmt_price(sig['sl'])}</code>",
+        entry_line,
+        f"وقف الخسارة: <code>{_fmt_price(sig['sl'])}</code> (−{abs(sig['entry']-sig['sl'])/sig['entry']*100:.2f}%)",
         f"الهدف 1: <code>{_fmt_price(sig['tp1'])}</code>",
         f"الهدف 2: <code>{_fmt_price(sig['tp2'])}</code>",
         f"الهدف 3: <code>{_fmt_price(sig['tp3'])}</code>",
@@ -119,6 +124,19 @@ def event_message(event):
         )
 
     emoji = "✅" if pnl >= 0 else "🛑"
+    if event["reason"] in ("TP2", "TP3"):
+        n = "2" if event["reason"] == "TP2" else "3"
+        entry = event.get("entry", 0)
+        target = event.get("price", 0)
+        res_pct = ((target - entry) / entry * 100) if entry else 0
+        if event.get("direction") == "short":
+            res_pct = -res_pct
+        return (
+            f"🎯 <b>{sym} بلغ الهدف {n}</b>\n"
+            f"الدخول: {_fmt_price(entry)}، الهدف: {_fmt_price(target)}، "
+            f"النتيجة: <b>{res_pct:+.2f}%</b>.\n"
+            f"هذا التحليل صدر من التطبيق وتُوبعت نتيجته آلياً — لا مجرد ادّعاء."
+        )
 
     reason_ar = {
         "TP2": "الهدف الثاني 🎯🎯",
@@ -160,8 +178,67 @@ def publish_event(event, reply_to=None):
     return _send(event_message(event), reply_to=reply_to)
 
 
+def analysis_message(a):
+    pair = a["symbol"].replace("USDT", "/USDT")
+    if a["direction"] == "long":
+        trend_ar, trend_emoji = "صاعد", "📈"
+    elif a["direction"] == "short":
+        trend_ar, trend_emoji = "هابط", "📉"
+    else:
+        trend_ar, trend_emoji = "محايد", "➡️"
+    lines = [
+        f"📊 <b>تحليل {pair}</b>",
+        f"سبوت · فريم 4 ساعات · {a['risk_emoji']} مخاطرة {a['risk_level']}",
+        "",
+        f"💪 قوة الشراء <b>{a['long_score']}</b>/100 · قوة البيع <b>{a['short_score']}</b>/100",
+        f"{trend_emoji} الاتجاه: <b>{trend_ar}</b> (ADX {a['adx']})",
+        "",
+        a["analysis"],
+        "",
+        f"🎯 الدخول المقترح: <code>{_fmt_price(a['entry'])}</code>",
+        f"🛡️ وقف الخسارة: <code>{_fmt_price(a['sl'])}</code>",
+        f"🎯 الأهداف: <code>{_fmt_price(a['tp1'])}</code> · <code>{_fmt_price(a['tp2'])}</code> · <code>{_fmt_price(a['tp3'])}</code>",
+        "",
+        f"{a['verdict_emoji']} <b>الحكم: {a['verdict']}</b>",
+        "",
+        "تحليل تقني آلي — سبوت فقط، بلا رافعة. ليست نصيحة استثمارية.",
+    ]
+    return "\n".join(lines)
+
+
+def publish_analysis(a, reply_to=None):
+    return _send(analysis_message(a), reply_to=reply_to)
+
+
 def publish_summary(stats):
     return _send(summary_message(stats))
+
+
+def weekly_rollup_message(trades):
+    total = len(trades)
+    if not total:
+        return "📊 <b>حصيلة الأسبوع</b>\n\nلا صفقات مغلقة هذا الأسبوع."
+    wins = [t for t in trades if t.get("pnl", 0) > 0]
+    losses = [t for t in trades if t.get("pnl", 0) <= 0]
+    hit_rate = round(len(wins) / total * 100, 1)
+    best = max(trades, key=lambda t: t.get("pnl_pct", 0))
+    worst = min(trades, key=lambda t: t.get("pnl_pct", 0))
+    total_pnl = sum(t.get("pnl", 0) for t in trades)
+    lines = [
+        "📊 <b>حصيلة الأسبوع</b>", "",
+        f"الصفقات المغلقة: <b>{total}</b>",
+        f"بلغت الهدف: <b>{len(wins)}</b> · أُغلقت على الوقف: <b>{len(losses)}</b>",
+        f"نسبة الإصابة: <b>{hit_rate}%</b>",
+        f"أفضل صفقة: <b>{best['symbol'].replace('USDT', '/USDT')}</b> {best.get('pnl_pct', 0):+.2f}%",
+        f"أسوأ صفقة: <b>{worst['symbol'].replace('USDT', '/USDT')}</b> {worst.get('pnl_pct', 0):+.2f}%",
+        f"صافي الربح: <b>${total_pnl:+.2f}</b>", "",
+        "ننشر الربح والخسارة معاً — وكل تحليل يُتابع آلياً من لحظة صدوره.",
+    ]
+    return "\n".join(lines)
+
+
+def publish_weekly_rollup(trades):
+    return _send(weekly_rollup_message(trades))
 
 
 def publish_startup():
