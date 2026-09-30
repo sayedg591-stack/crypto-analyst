@@ -3,6 +3,31 @@
 
 import os
 
+
+def _load_dotenv(path="/home/ubuntu/bot/.env"):
+    """تحميل متغيرات البيئة من ملف .env — لأن cron لا يملكها في بيئته."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv()
+
+# أسماء بديلة للتوافق: GIST_ID/GH_PAT في .env ←→ KDRX_GIST_ID/GITHUB_TOKEN في الكود
+if not os.environ.get("KDRX_GIST_ID") and os.environ.get("GIST_ID"):
+    os.environ["KDRX_GIST_ID"] = os.environ["GIST_ID"]
+if not os.environ.get("GITHUB_TOKEN") and os.environ.get("GH_PAT"):
+    os.environ["GITHUB_TOKEN"] = os.environ["GH_PAT"]
+
 # ---------- Binance (بيانات عمومية مجانية — بدون مفتاح) ----------
 BINANCE_API = "https://data-api.binance.vision"
 KLINES_ENDPOINT = f"{BINANCE_API}/api/v3/klines"
