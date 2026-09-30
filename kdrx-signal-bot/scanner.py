@@ -246,7 +246,7 @@ def _fmt(x):
 
 # ================= التقييم (0-100) =================
 
-def score_row(row, prev):
+def _raw_scores(row, prev):
     """تقييم شمعة واحدة → (نقاط الشراء 0-100، نقاط البيع 0-100، التفاصيل)."""
     long_pts, short_pts, details = 0.0, 0.0, {}
 
@@ -331,13 +331,38 @@ def score_row(row, prev):
 
     total = long_pts + short_pts
     if total == 0:
-        return 50, 50, details, "neutral"
+        return 50.0, 50.0, details
 
     long_score = round(long_pts)  # من 100 (مجموع الأوزان = 100)
     short_score = round(short_pts)
+    return long_score, short_score, details
+
+
+def score_row(row, prev):
+    long_score, short_score, details = _raw_scores(row, prev)
     direction = "long" if long_score > short_score else "short" if short_score > long_score else "neutral"
     strength = max(long_score, short_score)
     return strength, direction, details, direction
+
+
+def buyer_dominance(df, lookback=None):
+    lookback = lookback or config.DOMINANCE_LOOKBACK
+    try:
+        recent = df.tail(lookback)
+        taker_buy = recent["taker_base"].astype(float).sum()
+        total = recent["volume"].astype(float).sum()
+        if total <= 0:
+            return 0.5
+        return float(taker_buy / total)
+    except Exception:
+        return 0.5
+
+
+def risk_fraction(strength):
+    span = 100 - config.MIN_SCORE
+    f = (strength - config.MIN_SCORE) / span if span > 0 else 0
+    f = max(0.0, min(1.0, f))
+    return config.RISK_MIN + f * (config.RISK_MAX - config.RISK_MIN)
 
 
 # ================= بناء الإشارة =================
@@ -357,59 +382,68 @@ def build_signal(symbol, df):
 
     strength, direction, details, _ = score_row(row, prev)
 
+    # Kdrx: شراء فقط (long-only spot)
+    if direction != "long":
+        return None
+
     # البوابة: نقاط ≥ 55 و ADX > 20
-    if direction == "neutral" or strength < config.MIN_SCORE:
+    if strength < config.MIN_SCORE:
         return None
     if row["adx"] < config.MIN_ADX:
         return None
 
+    # بوابة السيطرة (نظام الحيتان): لا دخول إذا البائعون مسيطرون
+    dominance = buyer_dominance(df)
+    if dominance < config.MIN_BUYER_DOMINANCE:
+        return None
+
     entry = float(row["close"])
 
-    # فلتر Kdrx: الدخول قرب الدعم (شراء) أو قرب المقاومة (بيع)
+    # فلتر Kdrx: الدخول قرب الدعم
     support, resistance = find_support_resistance(df)
-    if direction == "long" and not is_near_support(entry, support):
+    if not is_near_support(entry, support):
         return None  # السعر بعيد عن الدعم — ليست صفقة Kdrx
-    if direction == "short" and not is_near_resistance(entry, resistance):
-        return None
 
     atr_val = float(row["atr"])
     sl_dist = atr_val * config.ATR_SL_MULT
 
-    if direction == "long":
-        sl = entry - sl_dist
-        tp1 = entry + sl_dist * config.TP_MULTIPLES[0]
-        tp2 = entry + sl_dist * config.TP_MULTIPLES[1]
-        tp3 = entry + sl_dist * config.TP_MULTIPLES[2]
-    else:
-        sl = entry + sl_dist
-        tp1 = entry - sl_dist * config.TP_MULTIPLES[0]
-        tp2 = entry - sl_dist * config.TP_MULTIPLES[1]
-        tp3 = entry - sl_dist * config.TP_MULTIPLES[2]
+    sl = entry - sl_dist
+    tp1 = entry + sl_dist * config.TP_MULTIPLES[0]
+    tp2 = entry + sl_dist * config.TP_MULTIPLES[1]
+    tp3 = entry + sl_dist * config.TP_MULTIPLES[2]
 
-    rr = round(sl_dist * config.TP_MULTIPLES[0] / sl_dist, 2)  # = 2.0 (مثل Kdrx)
-    risk_pct = round(sl_dist / entry * 100, 2)
+    # منطقة الدخول ±1.5% (مثل Kdrx: الدخول 68.06، منطقة 67.066–69.054)
+    zp = config.ENTRY_ZONE_PCT
+    entry_lo, entry_hi = entry * (1 - zp), entry * (1 + zp)
+
+    rr = round(sl_dist * config.TP_MULTIPLES[0] / sl_dist, 2)
+    rfrac = risk_fraction(strength)
+    risk_pct = round(rfrac * 100, 2)
 
     # حقول Kdrx الإضافية
     risk_lbl, risk_emoji = risk_level(strength)
     rsi_val = float(row["rsi"]) if pd.notna(row["rsi"]) else 50
     vol_r = float(row["vol_ratio"]) if pd.notna(row["vol_ratio"]) else 1.0
-    analysis = build_analysis_text(direction, rsi_val, support, resistance, vol_r, entry)
+    analysis = build_analysis_text("long", rsi_val, support, resistance, vol_r, entry)
 
     return {
         "symbol": symbol,
-        "direction": direction,  # long = شراء, short = بيع
+        "direction": "long",  # long = شراء
         "timeframe": config.TIMEFRAME,
         "type": "spot",
         "strength": strength,
         "entry": round(entry, 6),
+        "entry_zone": (round(entry_lo, 6), round(entry_hi, 6)),
         "sl": round(sl, 6),
         "tp1": round(tp1, 6),
         "tp2": round(tp2, 6),
         "tp3": round(tp3, 6),
         "rr": f"{rr:.0f} : 1",
         "risk_pct": risk_pct,
+        "risk_frac": round(rfrac, 4),
         "adx": round(float(row["adx"]), 1),
         "atr": round(atr_val, 6),
+        "dominance": round(dominance * 100, 1),
         "details": details,
         "candle_time": int(df["open_time"].iloc[-2]),
         "created_at": int(time.time()),
@@ -467,6 +501,63 @@ def scan_all_sequential():
             print(f"[SCANNER] SIGNAL {symbol} {sig['direction']} strength={sig['strength']}", flush=True)
         time.sleep(0.2)
     return signals
+
+
+def analyze_asset(symbol):
+    df = fetch_klines(symbol)
+    if df is None or len(df) < 60:
+        return None
+    df = compute_indicators(df.copy())
+    row = df.iloc[-2]
+    prev = df.iloc[-3]
+    if pd.isna(row["adx"]) or pd.isna(row["atr"]) or pd.isna(row["rsi"]):
+        return None
+    long_score, short_score, details = _raw_scores(row, prev)
+    direction = "long" if long_score > short_score else "short" if short_score > long_score else "neutral"
+    strength = max(long_score, short_score)
+    entry = float(row["close"])
+    atr_val = float(row["atr"])
+    sl_dist = atr_val * config.ATR_SL_MULT
+    support, resistance = find_support_resistance(df)
+    rsi_val = float(row["rsi"]) if pd.notna(row["rsi"]) else 50.0
+    adx_val = float(row["adx"])
+    vol_r = float(row["vol_ratio"]) if pd.notna(row["vol_ratio"]) else 1.0
+    dom = direction if direction != "neutral" else "long"
+    if dom == "long":
+        sl = entry - sl_dist
+        tp1 = entry + sl_dist * config.TP_MULTIPLES[0]
+        tp2 = entry + sl_dist * config.TP_MULTIPLES[1]
+        tp3 = entry + sl_dist * config.TP_MULTIPLES[2]
+    else:
+        sl = entry + sl_dist
+        tp1 = entry - sl_dist * config.TP_MULTIPLES[0]
+        tp2 = entry - sl_dist * config.TP_MULTIPLES[1]
+        tp3 = entry - sl_dist * config.TP_MULTIPLES[2]
+    near_sr = (is_near_support(entry, support) if dom == "long"
+               else is_near_resistance(entry, resistance))
+    if direction != "neutral" and strength >= config.MIN_SCORE and adx_val >= config.MIN_ADX and near_sr:
+        verdict_emoji = "🟢"
+        verdict = f"منطقة {'شراء' if direction == 'long' else 'بيع'}"
+    elif strength >= 45:
+        verdict_emoji = "🟡"
+        verdict = "إشارات مختلطة — انتظر تأكيداً أوضح"
+    else:
+        verdict_emoji = "🔴"
+        verdict = "لا توجد فرصة واضحة الآن — تجنّب"
+    risk_lbl, risk_emoji = risk_level(strength)
+    analysis = build_analysis_text(dom, rsi_val, support, resistance, vol_r, entry)
+    return {
+        "symbol": symbol, "price": round(entry, 6), "direction": direction,
+        "strength": strength, "long_score": long_score, "short_score": short_score,
+        "adx": round(adx_val, 1), "rsi": round(rsi_val, 1), "vol_ratio": round(vol_r, 2),
+        "support": round(support, 6) if support else None,
+        "resistance": round(resistance, 6) if resistance else None,
+        "entry": round(entry, 6), "sl": round(sl, 6),
+        "tp1": round(tp1, 6), "tp2": round(tp2, 6), "tp3": round(tp3, 6),
+        "verdict_emoji": verdict_emoji, "verdict": verdict,
+        "risk_level": risk_lbl, "risk_emoji": risk_emoji,
+        "analysis": analysis, "details": details, "at": int(time.time()),
+    }
 
 
 if __name__ == "__main__":
