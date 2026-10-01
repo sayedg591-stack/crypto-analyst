@@ -141,10 +141,17 @@ def run_monitor_only():
 def publish_gist(wallet):
     """نشر الحالة إلى Gist للـ dashboard (مزامنة)."""
     try:
+        kdrx_real = {}
+        try:
+            with open(os.path.join(os.path.dirname(__file__), "state", "kdrx_real.json")) as f:
+                kdrx_real = json.load(f)
+        except Exception:
+            pass
         gist_state = {
             "wallet": wallet.to_dict(),
             "system": sysstats.get_stats(),
             "sources": sources.get_status(),
+            "kdrx_real": kdrx_real,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         gist_pub.publish(gist_state)
