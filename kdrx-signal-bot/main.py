@@ -105,6 +105,17 @@ def run_monitor_only():
         publisher.publish_event(ev, reply_to=reply_to)
         log.info(f"Published event {ev['reason']} {ev['symbol']} pnl={ev['pnl']}")
 
+    # نسخ KDRX الحي: مراقبة المراكز المفتوحة من الإشارات المُحوّلة
+    try:
+        import kdrx_live
+        for kev in kdrx_live.check_positions():
+            kw = kdrx_live.get_wallet()
+            pos = kw.data["positions"].get(kev.get("pos_id", ""))
+            publisher.publish_kdrx_live_event(kev, reply_to=pos.get("signal_msg_id") if pos else None)
+            log.info(f"KDRX-live event {kev['reason']} {kev['symbol']} pnl={kev['pnl']}")
+    except Exception as e:
+        log.warning(f"KDRX-live monitor failed: {e}")
+
     # نبض السوق كل 6 ساعات
     state = load_signals_state()
     last_pulse = state.get("last_pulse", 0)
@@ -147,11 +158,18 @@ def publish_gist(wallet):
                 kdrx_real = json.load(f)
         except Exception:
             pass
+        kdrx_live_state = {}
+        try:
+            import kdrx_live
+            kdrx_live_state = kdrx_live.gist_state()
+        except Exception:
+            pass
         gist_state = {
             "wallet": wallet.to_dict(),
             "system": sysstats.get_stats(),
             "sources": sources.get_status(),
             "kdrx_real": kdrx_real,
+            "kdrx_live": kdrx_live_state,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         gist_pub.publish(gist_state)

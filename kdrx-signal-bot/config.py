@@ -104,3 +104,8 @@ STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
 WALLET_FILE = os.path.join(STATE_DIR, "wallet.json")
 SIGNALS_FILE = os.path.join(STATE_DIR, "signals.json")
 LOG_FILE = os.path.join(STATE_DIR, "bot.log")
+
+# ---------- نسخ KDRX الحي (إشارات مُحوّلة من أيوب) ----------
+KDRX_LIVE_WALLET_FILE = os.path.join(STATE_DIR, "kdrx_live.json")
+KDRX_LIVE_RISK = 0.05          # مخاطرة افتراضية 5% إذا لم تُذكر في الإشارة
+KDRX_LIVE_MAX_POSITIONS = 5

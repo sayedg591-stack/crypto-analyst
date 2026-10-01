@@ -18,6 +18,7 @@ import config
 from scanner import analyze_asset, fetch_market_pulse, fetch_klines
 from wallet import PaperWallet
 import publisher
+import kdrx_live
 
 os.makedirs(config.STATE_DIR, exist_ok=True)
 logging.basicConfig(
@@ -116,6 +117,7 @@ def help_text():
         "الأوامر:\n"
         "📈 <code>نبض</code> — نبض السوق الآن\n"
         "💰 <code>محفظة</code> — حالة المحفظة الورقية\n"
+        "📋 <b>حوّل أي إشارة KDRX</b> (forward) لأفتح نسختها الورقية فوراً\n"
         "❓ <code>مساعدة</code> — هذه الرسالة"
     )
 
@@ -123,6 +125,26 @@ def help_text():
 def handle(chat_id, text, msg_id):
     t = text.strip()
     low = t.lower()
+
+    # إشارة KDRX مُحوّلة من أيوب → فتح نسخة ورقية حية
+    if kdrx_live.looks_like_kdrx(t):
+        parsed, reason = kdrx_live.parse_kdrx_signal(t)
+        if not parsed:
+            send(chat_id,
+                 f"⚠️ وصلتني رسالة KDRX لكن ما فهمت الأرقام: {reason}\n"
+                 "صيفط الإشارة كاملة (الدخول + الوقف + الأهداف الثلاثة).",
+                 reply_to=msg_id)
+            return
+        pos_id, res = kdrx_live.open_kdrx_trade(parsed)
+        if pos_id:
+            w = kdrx_live.get_wallet()
+            w.set_signal_msg_id(pos_id, msg_id)  # للاقتباس عند TP/SL
+            send(chat_id, publisher.kdrx_live_open_message(parsed, res), reply_to=msg_id)
+            log.info(f"KDRX-live opened {parsed['symbol']} {parsed['direction']} entry={parsed['entry']}")
+        else:
+            send(chat_id, f"⚠️ ما فتحت الصفقة: {kdrx_live.describe_open_error(res)}",
+                 reply_to=msg_id)
+        return
 
     if low in ("/start", "مساعدة", "مساعده", "help", "؟", "?"):
         send(chat_id, help_text(), reply_to=msg_id)
